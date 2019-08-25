@@ -20,14 +20,37 @@ import datetime
 
 
 
-## 
+#  Class Declarations 
+class StimSweepData:
+        pass
+        
+#     def __init__(self, Ts, 
+#                  mseImgSet, wmsImgSet, ssmImgSet,
+#                  mseActSet, wmsActSet, ssmActSet,
+#                  mseRecSet, wmsRecSet, ssmRecSet):
+#         
+#         self.Ts        = np.asarray(Ts)
+#         self.mseImgSet = np.asarray(mseImgSets)
+#         self.wmsImgSet = np.asarray(wmsImgSets)
+#         self.ssmImgSet = np.asarray(ssmImgSets)
+#         
+#         self.mseActSet = np.asarray(mseActSets)
+#         self.wmsActSet = np.asarray(wmsActSets)
+#         self.ssmActSet = np.asarray(ssmActSets)
+#         
+#         self.mseRecSet = np.asarray(mseRecSets)
+#         self.wmsRecSet = np.asarray(wmsRecSets)
+#         self.ssmRecSet = np.asarray(ssmRecSets)
 
-#Simulation Functions
+
+class ImageData:
+    pass
+
 
 
 def metricCompar(imgData,simParams,psychParams, electrode):
     # Compare Error Metrics Side-by-Side for the same set of images    
-    
+    img    = imgData.origImg
     imgSet = imgData.imgSet
     xs     = imgData.xs
     ys     = imgData.ys
@@ -412,21 +435,22 @@ def preProcessImage(img,psychParams,simParams):
     
     selecDims = getSelectionDims(psychParams,img)
 
-    imgSet,x,y = tileImage(img,selecDims)
+    imgSet, xs, ys  = tileImage(img,selecDims)
 
-    numImg = imgSet.shape[1]
-    resImgSet = np.zeros((pixelDims[0]*pixelDims[1],numImg))
+    numImgs = imgSet.shape[1]
+    resImgSet = np.zeros((pixelDims[0]*pixelDims[1],numImgs))
 
     # go through each image, resample it and store it in resImgSet
-    for i in np.arange(numImg):
+    for i in np.arange(numImgs):
         resImgSet[:,i],zoomF = resample(imgSet[:,i],selecDims,pixelDims)
     
-    class imgData:
-        numImgs = numImg
-        imgSet = resImgSet
-        xs = x
-        ys = y
-        zoomFac = zoomF
+    imgData = ImageData()
+    imgData.numImgs = numImgs
+    imgData.imgSet = resImgSet
+    imgData.xs = xs
+    imgData.ys = ys
+    imgData.zoomFac = zoomF
+    imgData.origImg    = img
     return imgData
 
 def getSelectionDims(psychParams,img):
@@ -464,7 +488,7 @@ def actSolver(img,simParams,psychParams,mode,electrode):
         varMtx = np.multiply(Phi,Phi)@V
         return  cp.sum(varMtx@x)
     
-    def reconsSSM(img, simParams, electrode, epsilon = 10**-3):
+    def reconsSSM(img, simParams, electrode, epsilon = 10**-2):
         # use bisection search to solve for an optimal-SSIM reconstruction
 
         def findFeasible(y,alpha,simParams, electrode ):
@@ -480,11 +504,11 @@ def actSolver(img,simParams,psychParams,mode,electrode):
             P = simParams["P"]
 
             if electrode:
-                x = cp.Variable(P.shape[1],integer=True)
+                x = cp.Variable(P.shape[1])
                 cost = varTerm(simParams, A , x)
                 Phi = A@P
             else:
-                x = cp.Variable(A.shape[1],integer=True)
+                x = cp.Variable(A.shape[1])
                 cost = 1
                 Phi = A
 
@@ -529,12 +553,12 @@ def actSolver(img,simParams,psychParams,mode,electrode):
         xCurr = np.zeros(actLength) # temporary solution
 
         # bisection search
-        while u - l > e:
+        while u - l >= e:
             alpha = (l+u)/2
             # find feasible x   let u = alpha
             isFeasible, xCurr = findFeasible(y, alpha, simParams, electrode)
 
-
+            print('u-l = %f'%(u-l))
             if isFeasible:
                 u = alpha
             elif alpha == 1:
@@ -548,7 +572,7 @@ def actSolver(img,simParams,psychParams,mode,electrode):
 
             if xCurr is not None: # only overwrite x is new value is generated
                 x = copy.deepcopy(xCurr)            
-
+        x = np.rint(x)
         if electrode:
             return A@P@x+mu, x
         else:
@@ -559,6 +583,7 @@ def actSolver(img,simParams,psychParams,mode,electrode):
     P = simParams["P"]
     T = simParams["numStims"]
     N = simParams["maxAct"]
+    pixelDims = simParams["pixelDims"]
     mu = np.mean(img)
     imgCopy = copy.deepcopy(img)
     imgCopy -= mu 
@@ -566,12 +591,8 @@ def actSolver(img,simParams,psychParams,mode,electrode):
 
     if electrode:
         x = cp.Variable(P.shape[1])
-        C = np.identity(P.shape[1])*-1
-        d = np.zeros((P.shape[1],))
     else:
         x = cp.Variable(A.shape[1])
-        C = np.identity(A.shape[1])*-1
-        d = np.zeros((A.shape[1],))
 
     if mode == "mse": 
         if electrode:
@@ -600,14 +621,14 @@ def actSolver(img,simParams,psychParams,mode,electrode):
         
     # Solve cost function and return x's value and the reconstructed image
     if T == -1:
-        prob= cp.Problem(cp.Minimize(cost),[x<=N,C@x >= d])
+        prob= cp.Problem(cp.Minimize(cost),[x<=N,x >= 0])
     else:
-        prob = cp.Problem(cp.Minimize(cost),[x<=N, x >= d, cp.sum(x) <= T])
+        prob = cp.Problem(cp.Minimize(cost),[x<=N, x >= 0, cp.sum(x) <= T])
         
     try:
         prob.solve(solver=cp.GUROBI)
     except:
-        prob.solve()
+        prob.solve(solver=cp.SCS)
     
     if electrode:
         return A@P@x.value+mu, x.value
@@ -662,21 +683,21 @@ def numStimSweep(imgData,simParams,psychParams,electrode):
         wmsRecSets.append(wmsRecons)
         ssmRecSets.append(ssmRecons)
         
-    class stimSweepData:
-        Ts        = np.logspace(0,5,Tres)
-        mseImgSet = np.asarray(mseImgSets)
-        wmsImgSet = np.asarray(wmsImgSets)
-        ssmImgSet = np.asarray(ssmImgSets)
+        ssData = StimSweepData()
+        ssData.Ts        = Ts
+        ssData.mseImgSet = np.asarray(mseImgSets)
+        ssData.wmsImgSet = np.asarray(wmsImgSets)
+        ssData.ssmImgSet = np.asarray(ssmImgSets)
         
-        mseActSet = np.asarray(mseActSets)
-        wmsActSet = np.asarray(wmsActSets)
-        ssmActSet = np.asarray(ssmActSets)
+        ssData.mseActSet = np.asarray(mseActSets)
+        ssData.wmsActSet = np.asarray(wmsActSets)
+        ssData.ssmActSet = np.asarray(ssmActSets)
         
-        mseRecSet = np.asarray(mseRecSets)
-        wmsRecSet = np.asarray(wmsRecSets)
-        ssmRecSet = np.asarray(ssmRecSets)
+        ssData.mseRecSet = np.asarray(mseRecSets)
+        ssData.wmsRecSet = np.asarray(wmsRecSets)
+        ssData.ssmRecSet = np.asarray(ssmRecSets)
         
-    return stimSweepData
+    return ssData
 
 def resample(img,currDims,desiredDims):
     # given a (currDims[0]*currDims[1] x 1 ) image vector, resample the image
