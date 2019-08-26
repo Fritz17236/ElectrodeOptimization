@@ -22,34 +22,36 @@ import datetime
 
 #  Class Declarations 
 class StimSweepData:
-        pass
         
-#     def __init__(self, Ts, 
-#                  mseImgSet, wmsImgSet, ssmImgSet,
-#                  mseActSet, wmsActSet, ssmActSet,
-#                  mseRecSet, wmsRecSet, ssmRecSet):
-#         
-#         self.Ts        = np.asarray(Ts)
-#         self.mseImgSet = np.asarray(mseImgSets)
-#         self.wmsImgSet = np.asarray(wmsImgSets)
-#         self.ssmImgSet = np.asarray(ssmImgSets)
-#         
-#         self.mseActSet = np.asarray(mseActSets)
-#         self.wmsActSet = np.asarray(wmsActSets)
-#         self.ssmActSet = np.asarray(ssmActSets)
-#         
-#         self.mseRecSet = np.asarray(mseRecSets)
-#         self.wmsRecSet = np.asarray(wmsRecSets)
-#         self.ssmRecSet = np.asarray(ssmRecSets)
-
-
+        
+    def __init__(self):
+        self.Ts        = None 
+        self.mseImgSet = None 
+        self.wmsImgSet = None
+        self.ssmImgSet = None
+         
+        self.mseActSet = None
+        self.wmsActSet = None
+        self.ssmActSet = None
+         
+        self.mseRecSet = None
+        self.wmsRecSet = None
+        self.ssmRecSet = No
 class ImageData:
-    pass
-
+    def __init__(self):
+        self.numImgs    = None
+        self.imgSet     = None
+        self.filtImgSet = None
+        self.xs         = None
+        self.ys         = None
+        self.zoomFac    = None
+        self.origImg   = None
+         
 def metricCompar(imgData,simParams,psychParams, electrode):
     # Compare Error Metrics Side-by-Side for the same set of images    
     img    = imgData.origImg
     imgSet = imgData.imgSet
+    fltSet = imgData.filtImgSet
     xs     = imgData.xs
     ys     = imgData.ys
     
@@ -61,7 +63,7 @@ def metricCompar(imgData,simParams,psychParams, electrode):
     print('MSE Activity Reconsruction:')
     mseImgs, mseActs = reconsImgSet(imgSet,simParams, psychParams, "mse", electrode)
     print('wMSE Activity Reconstruction')
-    wmsImgs, wmsActs = reconsImgSet(imgSet,simParams, psychParams, "wms", electrode)
+    wmsImgs, wmsActs = reconsImgSet(fltSet,simParams, psychParams, "mse", electrode)
     print('SSIM Activity Reconstruction')
     ssmImgs, ssmActs = reconsImgSet(imgSet,simParams, psychParams, "ssm", electrode)
     
@@ -109,6 +111,20 @@ def reconsImgSet(imgSet, simParams, psychParams, metric, electrode):
         imgs[:,i] = results[i,0]
         acts[:,i] = results[i,1]
     return imgs, acts   
+
+def loadRawImg(fName):
+    # given a filename for an rgb image, load and preprocess the image by doing the following:
+    # convert to grayscale --> zero-mean --> normalize to +/-5 .5 intensity
+    
+    
+    img = plt.imread(fName)
+    img = np.sum(img,2)/3
+
+    # Normalize to +/- .5 intensity range and zero mean
+    img -= np.mean(img)
+    img = img / np.max((np.abs(img))) 
+
+    return img
     
 def dct2(a):
     # 2D Discrete Cosine Transform and Its Inverse
@@ -441,11 +457,24 @@ def preProcessImage(img,psychParams,simParams):
         print('Tiled Image')        
         return subImgs, xs, ys
 
+    def csfFilterImg(img, psychParams):
+        # given an image and psychophysical parameters object,
+        # filter the image according to the contrast sensitivity function#
+        # and return the filtered image.
+        
+        W = csf(psychParams,img.shape)
+        filtImg = np.multiply(W,dct2(img))
+        filtImg = idct2(filtImg)
+        return filtImg/np.max(np.abs(filtImg))  - .5 # renormalize after filter
+        
+
+    filtImg   = csfFilterImg(img, psychParams)
     pixelDims = simParams["pixelDims"]
     
     selecDims = getSelectionDims(psychParams,img)
 
-    imgSet, xs, ys  = tileImage(img,selecDims)
+    imgSet, xs, ys        = tileImage(img,selecDims)
+    filtImgSet,xs, ys      = tileImage(filtImg, selecDims)
 
     numImgs = imgSet.shape[1]
     resImgSet = np.zeros((pixelDims[0]*pixelDims[1],numImgs))
@@ -457,10 +486,13 @@ def preProcessImage(img,psychParams,simParams):
     imgData = ImageData()
     imgData.numImgs = numImgs
     imgData.imgSet = resImgSet
+    imgData.filtImgSet = filtImgSet
     imgData.xs = xs
     imgData.ys = ys
     imgData.zoomFac = zoomF
     imgData.origImg    = img
+    imgData.filtImg    = filtImg
+    
     return imgData
 
 def getSelectionDims(psychParams,img):
@@ -548,11 +580,8 @@ def actSolver(img,simParams,psychParams,mode,electrode):
             actLength = A.shape[1]
 
 
-        # image preprocessing
-        imgCopy = copy.deepcopy(img)
-        mu = np.mean(imgCopy)
-        imgCopy -= mu 
-        y = imgCopy  
+        # image preprocessing 
+        y = img 
 
 
         # bisection initialization
@@ -584,9 +613,9 @@ def actSolver(img,simParams,psychParams,mode,electrode):
                 x = copy.deepcopy(xCurr)            
         x = np.rint(x)
         if electrode:
-            return A@P@x+mu, x
+            return A@P@x, x
         else:
-            return A@x+mu, x
+            return A@x, x
     
     
     A = simParams["A"]
@@ -594,10 +623,8 @@ def actSolver(img,simParams,psychParams,mode,electrode):
     T = simParams["numStims"]
     N = simParams["maxAct"]
     pixelDims = simParams["pixelDims"]
-    mu = np.mean(img)
-    imgCopy = copy.deepcopy(img)
-    imgCopy -= mu 
-    y = imgCopy
+
+    y = img
 
     if electrode:
         x = cp.Variable(P.shape[1])
@@ -641,10 +668,10 @@ def actSolver(img,simParams,psychParams,mode,electrode):
         prob.solve(solver=cp.SCS)
     
     if electrode:
-        return A@P@x.value+mu, x.value
+        return A@P@x.value, x.value
     else:
         try:
-            return A@x.value+mu, x.value
+            return A@x.value, x.value
         except:
                 print(W.shape)
                 print(D.shape)
@@ -1209,7 +1236,7 @@ def elecVecPlot(mseActs,jpgActs,eMap):
     plt.show()
     return
 
-def rebuildImg(img,imgSet,xs,ys,pixelDims,psychParams): 
+def rebuildImg(img,imgSet,xs,ys,pixelDims,psychParams,zeroMean=False): 
     # input params:
     # img: an mxn original image matching the desired image dimensions
     # imgSet a (numPixels x numImgs) matrix of flattened subimages
@@ -1242,7 +1269,10 @@ def rebuildImg(img,imgSet,xs,ys,pixelDims,psychParams):
         
         selection = recons[x:x+selecDims[0],y:y+selecDims[1]]
         reconsSel = reconsImg[0:selection.shape[0],0:selection.shape[1]]
-             
+        
+        # If zeromean, make the subimage zero mean, then add the average intensity for the whole image
+        if zeroMean:
+            reconsSel -= np.mean(reconsSel) 
         recons[x:x+selection.shape[0],y:y+selection.shape[1]] += reconsSel
     
     return recons  
