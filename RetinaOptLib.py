@@ -46,8 +46,6 @@ class StimSweepData:
 class ImageData:
     pass
 
-
-
 def metricCompar(imgData,simParams,psychParams, electrode):
     # Compare Error Metrics Side-by-Side for the same set of images    
     img    = imgData.origImg
@@ -305,6 +303,18 @@ def csf(psychParams,pixelDims):
     )
     W = np.divide(num,denom)
     return W
+
+def pruneDecoder(A):
+    # remove the columns of A corresponding to the cells which don't change the image
+    # reconstruction
+    
+    # if a column of A has a norm of 0 it must be all 0, so delete the column. 
+    delList = []
+    for i in np.arange(A.shape[1]):
+        if (np.linalg.norm(A[:,i])) <= 10**-6:
+            delList.append(i)
+            
+    return np.delete(A,delList,axis=1)
 
 def pruneDict(P,eActs,threshold=.01):
     # Given a dictionary and a threshol value, remove any dictionary elements whose maximum value is 
@@ -1236,3 +1246,128 @@ def rebuildImg(img,imgSet,xs,ys,pixelDims,psychParams):
         recons[x:x+selection.shape[0],y:y+selection.shape[1]] += reconsSel
     
     return recons  
+
+def actAnglePlot(mseActs,otherActs,otherMetricLabel):
+    # given two actLength x numImgs matrices of activity over a numImgs set of images,
+    # calculate the angle between each pair of activities over all image and plot this
+    # angle on a polar graph, where the radius of each data point is the sum of the 
+    # activity of the other activity minus the sum of the MSE activity.
+    
+    numImgs =  mseActs.shape[1]
+    angles = np.zeros((numImgs,))
+    radii  = np.zeros((numImgs,))
+    
+    for imgNum in np.arange(numImgs):
+        angles[imgNum] = angBT(mseActs[:,imgNum],otherActs[:,imgNum])
+        radii[imgNum]  =(np.sum(otherActs[:,imgNum])-np.sum(mseActs[:,imgNum])) 
+    
+    pos = radii >= 0
+    neg = radii <  0 
+    
+    plt.polar(angles[pos],radii[pos],'ro',c='red')
+    plt.polar(angles[neg],np.abs(radii[neg]),'ro',c='blue')
+    plt.title('Angle Between MSE & '+otherMetricLabel+' Activity')
+    plt.show()
+    return
+
+def plotStimCompar(imgData, ssData, metric, psychParams, pixelDims):
+    # plot the error of given image sets versus number of stimulations according to  a specified metric, average over
+    #  all images for each number of stimulations data point
+    # Input: imgData: imgData object created by preProcessImage function
+    #        metric: metric according to which activities 1 and 2 will be plotted/calculated: "mse", "wms", or "ssm"
+    #        psychParams: a psychophysical parameters object 
+    #        ssData: Stimulation Sweep Data output from numStimSweep Function
+    #        pixelDims:  the dimensions of the unflattened image (e.g. (20, 20) )
+    
+    def getErr(refImg, img, metric,psychParams,pixelDims):
+        # given two images, calculate the error according to the given metric
+        # metric = "mse", "jpg", or "ssm"
+        if metric.upper() == "MSE":
+            return mse(refImg, img)/mse(refImg,np.zeros(refImg.shape))
+        elif metric.upper() == "WMS" :
+            return jpge(refImg, img, psychParams, pixelDims) / jpge(refImg, np.zeros(refImg.shape), psychParams, pixelDims)
+        elif metric.upper() == "SSIM":
+            return ((1-SSIM(refImg, img))/2) / ((1-SSIM(refImg,np.zeros(refImg.shape)/2)))
+        else: 
+            raise Exception("Bad Metric Passed to getErr")
+    
+    def getErrVecs(refImg, Ts, img1, img2, img3, metric, psychParams, pixelDims):
+        # given single images generated over numStimPoints number of stimulations, return a numStimPointsx1 vector 
+        # of error of each image according to the given metric
+        # img1, img2, img3:  3 numPixels x numStimPoints matrices of activity(error is calculated over pixels)
+        
+        # Initialization
+        errs1 = np.zeros((Ts.size,)) # Error Vector for set 1
+        errs2 = np.zeros((Ts.size,)) # Error Vector for set 2
+        errs3 = np.zeros((Ts.size,)) # Error Vector for set 3
+
+
+        # caclulate the error of the first set of images, computing a numStimPoints vector of errors:
+        for StimIdx in np.arange(Ts.size):
+            errs1[StimIdx] = getErr(refImg,img1[:,StimIdx], metric, psychParams, pixelDims)
+            errs2[StimIdx] = getErr(refImg,img2[:,StimIdx], metric, psychParams, pixelDims)
+            errs3[StimIdx] = getErr(refImg,img3[:,StimIdx], metric, psychParams, pixelDims)
+        
+        return errs1, errs2, errs3
+    
+    # Initialization
+    numImgs = imgData.numImgs
+    Ts      = ssData.Ts
+    errMat1 = np.zeros((numImgs,Ts.size))  # holds err vs stimulation vectors for numImgs, from imgSet 1
+    errMat2 = np.zeros((numImgs,Ts.size))  # same for imgSet 2
+    errMat3 = np.zeros((numImgs,Ts.size))  # same for imgSet 3
+
+    
+    
+    # For each image i, generate the error vectors for imgs1, imgs2 and store in errMat1, errMat2
+    for i in np.arange(numImgs):
+        mseImgs = ssData.mseImgSet[:,:,i]
+        wmsImgs = ssData.wmsImgSet[:,:,i]
+        ssmImgs = ssData.ssmImgSet[:,:,i]
+        refImg = imgData.imgSet[:,i]
+        errMat1[i,:], errMat2[i,:], errMat3[i,:] = getErrVecs(refImg, Ts, mseImgs.T, wmsImgs.T, ssmImgs.T, metric, psychParams, pixelDims)
+
+    avgs1 = np.mean(errMat1,0)
+    stds1 = np.std(errMat1,0) / np.sqrt(numImgs)
+    avgs2 = np.mean(errMat2,0)
+    stds2 = np.std(errMat2,0) / np.sqrt(numImgs)
+    avgs3 = np.mean(errMat3,0)
+    stds3 = np.std(errMat3,0) / np.sqrt(numImgs)
+    
+    plt.semilogx(Ts,avgs1)
+    plt.semilogx(Ts,avgs2)
+    plt.errorbar(Ts,avgs1,yerr=stds1,label="MSE")
+    plt.errorbar(Ts,avgs2,yerr=stds2,label="wMSE")
+    plt.errorbar(Ts,avgs3,yerr=stds3,label="SSIM")
+
+    plt.xlabel('Number of Allowable Stimulations')
+    plt.ylabel("Error")
+    string = "Relative " + metric + " Error vs. Number of Stimulations"
+    plt.title(string)
+    plt.ylim([0,1])
+    plt.legend()
+
+def actHist(activity,metric,alpha):
+    # given a actLength x numImgs set of activity over numImgs images,
+    # generate and plot a histogram of sum of activity for each image over
+    # the image set. 
+    actSum = np.sum(activity,0)
+    bins = np.linspace(0, 3000, 100)
+    
+    if metric.upper() == "MSE":
+        label = metric + " Activity, Avg Spikes = %i" %np.mean(actSum)
+        color = 'red'
+    elif metric.upper() == "WMSE":
+        label = metric + "Activity, Avg Spikes = %i" %np.mean(actSum)
+        color = 'green'
+    else:
+        label = metric + "Activity, Avg Spikes = %i" %np.mean(actSum)
+        color = 'blue'
+    plt.hist(actSum,bins=bins,label=label,alpha=alpha,color=color)
+    plt.axvline(x=np.mean(actSum),color=color)
+    plt.title('Histogram of Total Number of Spikes Across Image Set',fontSize=18)
+    plt.xlabel('Total Number of Spikes',fontsize=18)
+    plt.ylabel('Number of Images',fontsize=18)
+    plt.legend()
+    
+    
