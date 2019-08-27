@@ -46,6 +46,7 @@ class ImageData:
         self.ys         = None
         self.zoomFac    = None
         self.origImg   = None
+        self.selecDims = None
          
 def metricCompar(imgData,simParams,psychParams, electrode):
     # Compare Error Metrics Side-by-Side for the same set of images    
@@ -61,11 +62,11 @@ def metricCompar(imgData,simParams,psychParams, electrode):
         print('Solving for Cellular Activities...')    
     
     print('MSE Activity Reconsruction:')
-    mseImgs, mseActs = reconsImgSet(imgSet,simParams, psychParams, "mse", electrode)
+    mseImgs, mseActs = reconsImgSet(imgSet,imgData, simParams, psychParams, "mse", electrode)
     print('wMSE Activity Reconstruction')
-    wmsImgs, wmsActs = reconsImgSet(fltSet,simParams, psychParams, "mse", electrode)
+    wmsImgs, wmsActs = reconsImgSet(imgSet,imgData, simParams, psychParams, "wms", electrode)
     print('SSIM Activity Reconstruction')
-    ssmImgs, ssmActs = reconsImgSet(imgSet,simParams, psychParams, "ssm", electrode)
+    ssmImgs, ssmActs = reconsImgSet(imgSet,imgData, simParams, psychParams, "ssm", electrode)
     
     print('Activities Solved. Rebuilding Images ...')
     pixelDims = simParams["pixelDims"]
@@ -83,7 +84,7 @@ def metricCompar(imgData,simParams,psychParams, electrode):
             mseRecons, wmsRecons, ssmRecons
            )
 
-def reconsImgSet(imgSet, simParams, psychParams, metric, electrode):
+def reconsImgSet(imgSet, imgData, simParams, psychParams, metric, electrode):
     # Given a set of images (imgSet) as a 2d Matrix, and a metric, reconstruct
     # the image set according to the given image in parallel according to the available cpu cores    
     if electrode:
@@ -102,7 +103,7 @@ def reconsImgSet(imgSet, simParams, psychParams, metric, electrode):
     num_cores = mp.cpu_count()
     
     # run reconstructions in parallel
-    results = np.asarray(Parallel(n_jobs=num_cores)(delayed(actSolver)(i,simParams,psychParams,metric,electrode) for i in tqdm(imgList)))
+    results = np.asarray(Parallel(n_jobs=num_cores)(delayed(actSolver)(i,imgData,simParams,psychParams,metric,electrode) for i in tqdm(imgList)))
 
     #convert results back to 2 variables separating activity and the reconstructed image
     imgs = np.zeros((numPixels,numImgs))
@@ -115,12 +116,10 @@ def reconsImgSet(imgSet, simParams, psychParams, metric, electrode):
 def loadRawImg(fName):
     # given a filename for an rgb image, load and preprocess the image by doing the following:
     # convert to grayscale --> zero-mean --> normalize to +/-5 .5 intensity
-    
-    
     img = plt.imread(fName)
     img = np.sum(img,2)/3
 
-    # Normalize to +/- .5 intensity range and zero mean
+    # Normalize to +/- 1 intensity range and zero mean
     img -= np.mean(img)
     img = img / np.max((np.abs(img))) 
 
@@ -218,14 +217,18 @@ def flatDCT(pixelDims):
     D = D2@D1
     return D
 
-def flatW(psychParams,pixelDims): 
+def flatW(psychParams,pixelDims,imgData): 
     # build and return a flattned W matrix for images (img) flattned with fortran ordering
-    Wp = csf(psychParams,pixelDims)
+    # (1/2) * N / D where D is horizontal degrees, N is number of blocks 
+    XO = psychParams["XO"]
+    N  =  int(imgData.origImg.shape[0]/imgData.sDims[0]) # number of selection blocks (number of samples of DC terms of each subImage)
+    offset = (1/2) * (N / XO)
+    Wp = csf(psychParams,pixelDims,offset=offset)
     flatW = np.reshape(Wp,(pixelDims[0]*pixelDims[1],),order='F')
     W = np.diag(flatW)
     return W
 
-def csf(psychParams,pixelDims):
+def csf(psychParams,pixelDims,offset=0):
     # given a peak sensitivity frequency pf, and a psychophysically determined pixels-per-degree of viusal field ppd,
     # and and image, return a mask that has the same shape as the image and applies a weighting to each pixel in the image
     # according to the contrast sensitivity function 
@@ -293,20 +296,18 @@ def csf(psychParams,pixelDims):
         u0 = u0 * (getNg(psychParams)/Ng0)**.5 * (term1 + term2 + .02)**-.5
         return 1 - np.exp(-(f/u0)**2)
     
-        
     k  = psychParams["k"]
     X0 = psychParams["elecXO"]
     Y0 = psychParams["elecYO"]
     T  = psychParams["T"]
+    sfRes = psychParams["sfRes"]
     Ng = getNg(psychParams)
     Ng0 = psychParams["Ng0"]
     ph0= 3*10**-8*Ng0/Ng  # neural noise term (sec / deg^2)
-    sfRes = 1/pixelDims[0] #spatial frequency resolution is set by the number of horizontal pixels in the image 
     fxx,fyy = np.meshgrid(np.arange(pixelDims[1]),np.arange(pixelDims[0]))
     ppd = pixelDims[0]/X0
-    fs = (sfRes * ppd *(fxx**2+fyy**2)**.5  )
+    fs = (sfRes * ppd *((fxx)**2+(fyy)**2)**.5  ) + offset
     
-
     num   = Mopt(fs,psychParams) / k
     
     if not psychParams["binocular"]:
@@ -476,22 +477,24 @@ def preProcessImage(img,psychParams,simParams):
     imgSet, xs, ys        = tileImage(img,selecDims)
     filtImgSet,xs, ys      = tileImage(filtImg, selecDims)
 
-    numImgs = imgSet.shape[1]
+    numImgs = filtImgSet.shape[1]
     resImgSet = np.zeros((pixelDims[0]*pixelDims[1],numImgs))
+    resFltSet = np.zeros((pixelDims[0]*pixelDims[1],numImgs))
 
     # go through each image, resample it and store it in resImgSet
     for i in np.arange(numImgs):
         resImgSet[:,i],zoomF = resample(imgSet[:,i],selecDims,pixelDims)
-    
+        resFltSet[:,i],zoomF = resample(filtImgSet[:,i],selecDims,pixelDims)
     imgData = ImageData()
     imgData.numImgs = numImgs
     imgData.imgSet = resImgSet
-    imgData.filtImgSet = filtImgSet
+    imgData.filtImgSet = resFltSet
     imgData.xs = xs
     imgData.ys = ys
     imgData.zoomFac = zoomF
     imgData.origImg    = img
     imgData.filtImg    = filtImg
+    imgData.sDims      = selecDims
     
     return imgData
 
@@ -505,7 +508,7 @@ def getSelectionDims(psychParams,img):
     selecDims = (selectionSize,selectionSize)
     return selecDims
 
-def actSolver(img,simParams,psychParams,mode,electrode):
+def actSolver(img,imgData,simParams,psychParams,mode,electrode):
     # Reconstruct an image according to the error metric specified by "mode"
     # Input: img : the image to be reconstructed, dims = psychParams["pixelDims"]
     #        simParams : a simulation parameters dictionary 
@@ -597,7 +600,6 @@ def actSolver(img,simParams,psychParams,mode,electrode):
             # find feasible x   let u = alpha
             isFeasible, xCurr = findFeasible(y, alpha, simParams, electrode)
 
-            print('u-l = %f'%(u-l))
             if isFeasible:
                 u = alpha
             elif alpha == 1:
@@ -638,7 +640,7 @@ def actSolver(img,simParams,psychParams,mode,electrode):
             cost = cp.sum_squares(y-A@x)
     
     elif mode == "wms":
-        W = flatW(psychParams,simParams["pixelDims"])
+        W = flatW(psychParams,simParams["pixelDims"],imgData)
         D = flatDCT(pixelDims)
         if electrode:
             cost = cp.sum_squares(W@D@(y-A@P@x)) + varTerm(simParams, W@D@A, x)
