@@ -36,7 +36,7 @@ class StimSweepData:
          
         self.mseRecSet = None
         self.wmsRecSet = None
-        self.ssmRecSet = No
+        self.ssmRecSet = None
 class ImageData:
     def __init__(self):
         self.numImgs    = None
@@ -45,9 +45,9 @@ class ImageData:
         self.xs         = None
         self.ys         = None
         self.zoomFac    = None
-        self.origImg   = None
-        self.selecDims = None
-         
+        self.origImg    = None
+        self.selecDims  = None
+
 def metricCompar(imgData,simParams,psychParams, electrode):
     # Compare Error Metrics Side-by-Side for the same set of images    
     img    = imgData.origImg
@@ -223,7 +223,7 @@ def flatW(psychParams,pixelDims,imgData):
     XO = psychParams["XO"]
     N  =  int(imgData.origImg.shape[0]/imgData.sDims[0]) # number of selection blocks (number of samples of DC terms of each subImage)
     offset = (1/2) * (N / XO)
-    Wp = csf(psychParams,pixelDims,offset=offset)
+    Wp = csf(psychParams,pixelDims,offset=offset) #offset frequency b
     flatW = np.reshape(Wp,(pixelDims[0]*pixelDims[1],),order='F')
     W = np.diag(flatW)
     return W
@@ -300,7 +300,7 @@ def csf(psychParams,pixelDims,offset=0):
     X0 = psychParams["elecXO"]
     Y0 = psychParams["elecYO"]
     T  = psychParams["T"]
-    sfRes = psychParams["sfRes"]
+    sfRes = 1/pixelDims[0]
     Ng = getNg(psychParams)
     Ng0 = psychParams["Ng0"]
     ph0= 3*10**-8*Ng0/Ng  # neural noise term (sec / deg^2)
@@ -321,19 +321,19 @@ def csf(psychParams,pixelDims,offset=0):
     W = np.divide(num,denom)
     return W
 
-def pruneDecoder(A):
+def pruneDecoder(A,P):
     # remove the columns of A corresponding to the cells which don't change the image
     # reconstruction
-    
+    # also delete the corresponding rows of P
     # if a column of A has a norm of 0 it must be all 0, so delete the column. 
     delList = []
     for i in np.arange(A.shape[1]):
         if (np.linalg.norm(A[:,i])) <= 10**-6:
             delList.append(i)
             
-    return np.delete(A,delList,axis=1)
+    return np.delete(A,delList,axis=1),np.delete(P,delList,axis=0)
 
-def pruneDict(P,eActs,threshold=.01):
+def pruneDict(P,eActs,threshold=.05):
     # Given a dictionary and a threshol value, remove any dictionary elements whose maximum value is 
     # below the threshold.  Append an element of zeros to the pruned dictionary. 
     pp = P.copy()
@@ -344,6 +344,8 @@ def pruneDict(P,eActs,threshold=.01):
     for i in  np.arange(dictLength):
         if ~np.any(pp[:,i]):
             toDel.append(i)
+    if ~np.any(pp[:,dictLength-1]):
+            toDel.append(dictLength-1)
     
     
     pp = np.delete(pp,toDel,axis=1)
@@ -352,14 +354,21 @@ def pruneDict(P,eActs,threshold=.01):
     return np.hstack((pp,np.zeros((pp.shape[0],1)))),  np.vstack((eActs,np.asarray(np.zeros((1,eActs.shape[1])))))
     
 def mse(A,B):
-    return np.linalg.norm(A-B)**2 / A.size
+    #flatten if not flat
+    if A.ndim > 1:
+        flatA = A.flatten()
+        flatB = B.flatten()
+        
+        return (flatA-flatB).T@(flatA-flatB)/flatA.size
+    else:
+        return (A-B).T@(A-B)/A.size
 
-def jpge(A,B,psychParams,pixelDims):
+def jpge(A,B,psychParams,pixelDims, imgData):
     jpge.D = flatDCT(pixelDims)
     diffImg = A - B
     if diffImg.ndim is not 1: #flatten image if not already flattened
         diffImg = diffImg.flatten
-    W = flatW(psychParams, pixelDims)
+    W = flatW(psychParams, pixelDims, imgData)
     W = W/np.max(W)
 
     return np.linalg.norm(W@jpge.D@diffImg)**2 / A.size
@@ -751,7 +760,7 @@ def resample(img,currDims,desiredDims):
 
 ## Visulization Functions
 
-def dispImgSetCorr(eLocs,eMap,imgs,mseActs,jpgActs, ssmActs):
+def dataPCAAnalysis(eLocs,eMap,imgs,mseActs,wmsActs, ssmActs):
     # given a set of images, electrode locations, and their dictionary reconstructions,
     # calculate correlations (if any) of electrode activity across the set of images 
     numImages = imgs.shape[1]
@@ -772,7 +781,7 @@ def dispImgSetCorr(eLocs,eMap,imgs,mseActs,jpgActs, ssmActs):
 #     print('Average Current for CSF Images: %i nC' % np.mean(jpgCurr))
 #     print('Average Current for SSIM Images: %i nC' % np.mean(ssmCurr))
 
-    data = np.hstack((mseActs,jpgActs,ssmActs))
+    data = np.hstack((mseActs,wmsActs,ssmActs))
     covdata = np.cov(data) # covariance matrix
     wdata,vdata = np.linalg.eig(covdata) # eigen decomposition of covariance matrix
 
@@ -790,7 +799,7 @@ def dispImgSetCorr(eLocs,eMap,imgs,mseActs,jpgActs, ssmActs):
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
     ax.scatter(data1[0:numImages-1],data2[0:numImages-1],data3[0:numImages-1],label='MSE',s=markerSize)
-    ax.scatter(data1[numImages:2*numImages-1],data2[numImages:2*numImages-1],data3[numImages:2*numImages-1],label='JPG',s=markerSize)
+    ax.scatter(data1[numImages:2*numImages-1],data2[numImages:2*numImages-1],data3[numImages:2*numImages-1],label='wMSE',s=markerSize)
     ax.scatter(data1[2*numImages:],data2[2*numImages:],data3[2*numImages:],c='red',label='SSIM',s=markerSize)
     ax.set_xlabel('Principal Component 1')
     ax.set_ylabel('Principal Component 2')
@@ -885,7 +894,7 @@ def dispImgSetCorr(eLocs,eMap,imgs,mseActs,jpgActs, ssmActs):
 
     return wdata,vdata
 
-def projectPC(data,pc1,pc2,pc3):
+def projectPCA(data,pc1,pc2,pc3):
     #given a dataDim x numPts matrix of data, and 3 dataDim principal component vectors,
     #return a numPts vector containing the scalar projection of the data onto the vector at each numpt
 
@@ -902,283 +911,12 @@ def projectPC(data,pc1,pc2,pc3):
         proj3[i] = np.dot(data[:,i],pc3)/(np.linalg.norm(pc3)*np.linalg.norm(data[:,i]))
     return (proj1,proj2,proj3)
 
-def eActStats(eLocs,eActs,xmse,xsfe,xjpg):
-    # electrical center of mass
-    mseAct, sfeAct, jpgAct = getElecAct(eActs,xmse,xsfe,xjpg)
-    numElectrodes = mseAct.size
-
-    #Means
-    mseMean = np.sum(mseAct)/numElectrodes
-    sfeMean = np.sum(sfeAct)/numElectrodes
-    jpgMean = np.sum(jpgAct)/numElectrodes
-
-   ## Centers of Mass
-    print('Centers of Mass:')
-    mseCOM = np.zeros((2,))
-    sfeCOM = np.zeros((2,))
-    jpgCOM = np.zeros((2,))
-    for i in np.arange(numElectrodes):
-        mseCOM += np.asarray([eLocs[i,0],eLocs[i,1]])*mseAct[i]/(mseMean*numElectrodes)
-        sfeCOM += np.asarray([eLocs[i,0],eLocs[i,1]])*sfeAct[i]/(sfeMean*numElectrodes)
-        jpgCOM += np.asarray([eLocs[i,0],eLocs[i,1]])*jpgAct[i]/(jpgMean*numElectrodes)
-
-
-   ## ECOM spread
-    mseSpread = np.zeros((2,))
-    sfeSpread = np.zeros((2,))
-    jpgSpread = np.zeros((2,))
-
-    for i in np.arange(numElectrodes):
-        mseSpread += ( mseAct[i]/(mseMean*numElectrodes)*(np.asarray([eLocs[i,0],eLocs[i,1]]) - mseCOM))**2
-        sfeSpread += ( sfeAct[i]/(sfeMean*numElectrodes)*(np.asarray([eLocs[i,0],eLocs[i,1]]) - sfeCOM))**2
-        jpgSpread += ( jpgAct[i]/(jpgMean*numElectrodes)*(np.asarray([eLocs[i,0],eLocs[i,1]]) - jpgCOM))**2
-
-    mseSpread = np.sqrt(mseSpread)/(numElectrodes - 1)
-    jpgSpread = np.sqrt(jpgSpread)/(numElectrodes - 1)
-    sfeSpread = np.sqrt(sfeSpread)/(numElectrodes - 1)
-
-    plt.show()
-
-    plt.figure(figsize=(10,10))
-    scale = .05
-    plt.subplot(2,1,1)
-    plt.scatter(eLocs[:,0],eLocs[:,1])
-    plt.scatter(mseCOM[0],mseCOM[1],s=scale*np.sum(mseAct),label='MSE (Avg Activity = %i stimulations/electrode)'%mseMean)
-    #plt.errorbar(mseCOM[0],mseCOM[1], xerr=mseSpread[0],yerr=mseSpread[1], fmt='o',label='MSE (Avg Activity = %i stimulations/electrode)'%mseMean)
-    plt.scatter(sfeCOM[0],sfeCOM[1],s=scale*np.sum(sfeAct),label='SFE (Avg Activity = %i stimulations/electrode)'%sfeMean)
-    #plt.errorbar(sfeCOM[0],sfeCOM[1], xerr=sfeSpread[0],yerr=sfeSpread[1],fmt='o',label='SFE (Avg Activity = %i stimulations/electrode)'%sfeMean)
-    plt.scatter(jpgCOM[0],jpgCOM[1],s=scale*np.sum(jpgAct),label='JPG (Avg Activity = %i stimulations/electrode)'%jpgMean)
-    #plt.errorbar(jpgCOM[0],jpgCOM[1], xerr=jpgSpread[0],yerr=jpgSpread[1],fmt='o',label='JPG (Avg Activity = %i stimulations/electrode)'%jpgMean)
-
-    plt.legend(loc='upper right')
-    plt.subplot(2,1,2)
-    scale = 1
-    plt.scatter(eLocs[:,0],eLocs[:,1],s=scale*sfeAct,label='SFE max = %i' %np.max(sfeAct),alpha=.7)
-    plt.scatter(eLocs[:,0],eLocs[:,1],s=scale*jpgAct,label='JPG max = %i' %np.max(jpgAct),alpha=.7)
-    plt.scatter(eLocs[:,0],eLocs[:,1],s=scale*mseAct,label='MSE max = %i' %np.max(mseAct),alpha=.7)
-    plt.scatter(eLocs[:,0],eLocs[:,1],c='grey')
-    plt.title('Average Electrode Activity for Mosaic Reconstruction')
-    plt.xlabel('Horizontal Location (um)',fontsize=20)
-    plt.ylabel('Vertical Location (um)',fontsize=20)
-    plt.legend(loc='upper right')
-    plt.show()
-
-    # ## coactivity maps not much interesting
-    # mseAct, sfeAct, jpgAct = getElecAct(eActs,xmses[:,imgNum],xsfes[:,imgNum],xjpgs[:,imgNum])
-    # elecNum = 502
-    # plt.scatter(eLocs[:,0],eLocs[:,1],s=(1/mseAct[elecNum])*mseAct[elecNum]*mseAct)
-    # plt.show()
-    # plt.scatter(eLocs[:,0],eLocs[:,1],s=(1/sfeAct[elecNum])*sfeAct[elecNum]*sfeAct)
-    # plt.show()
-    # plt.scatter(eLocs[:,0],eLocs[:,1],s=(1/jpgAct[elecNum])*jpgAct[elecNum]*jpgAct)
-
-    # imgNum = 0
-    # plt.imshow(np.reshape(imgs[:,imgNum],(80,40)),cmap='bone',vmax=.5,vmin=-.5)
-    # eActStats(eLocs,eActs,xmses[:,imgNum],xsfes[:,imgNum],xjpgs[:,imgNum])
-
-    return
-
-def dispAvgElecAct(eLocs,eActs,imgs,xmses,xsfes,xjpgs):
-    # eLocs is a 512 x 2 matrix containing (x,y) coords of 512 electrodes
-    # eActs is a 4646x2 matrix containing the electrode numbers of the 4646 dictionary elements 
-    # xmse,xsfe,xjpg are 4646 vectors contianing the amount of times each dictionary element is chosen
-    # Display the average electrode activity (number of times an electrode is activated) over a set of images
-    mseAct = np.zeros((512,))
-    sfeAct = np.zeros((512,))
-    jpgAct = np.zeros((512,))
-    numImgs = xmses.shape[1]
-    for imgNum in np.arange(numImgs):
-            (mse, sfe, jpg) = getElecAct(eActs,xmses[:,imgNum],xsfes[:,imgNum],xjpgs[:,imgNum])
-            mseAct += mse
-            sfeAct += sfe
-            jpgAct += jpg
-
-    mseAct = mseAct/numImgs
-    sfeAct = sfeAct/numImgs
-    jpgAct = jpgAct/numImgs
-
-    scale = numImgs/2
-
-
-    # Given electrode locations and a vector of activities, create a scatter plot of electrode locations with 
-    # marker size given by electrode activity
-    plt.figure(figsize=(20,20))
-    plt.scatter(eLocs[:,0],eLocs[:,1],s=scale*sfeAct,label='SFE numstims = %i' %np.sum(sfeAct),alpha=.7)
-    plt.scatter(eLocs[:,0],eLocs[:,1],s=scale*jpgAct,label='JPG numstims = %i' %np.sum(jpgAct),alpha=.7)
-    plt.scatter(eLocs[:,0],eLocs[:,1],s=scale*mseAct,label='MSE numstims = %i' %np.sum(mseAct),alpha=.7)
-    plt.scatter(eLocs[:,0],eLocs[:,1],c='grey')
-    plt.title('Average Electrode Activity for Mosaic Reconstruction (%i images)'%numImgs)
-    plt.xlabel('Horizontal Location (um)',fontsize=20)
-    plt.ylabel('Vertical Location (um)',fontsize=20)
-    plt.legend(loc='upper right',prop={'size': 20})
-    plt.axis('equal')
-   # plt.xlim([-1000, 0])
-    #plt.ylim([-600, 200])
-
-    # plt.figure(figsize=(20,20))
-    # plt.subplot(2,2,1)
-    # plt.imshow(np.reshape(imgs[:,imgNum],(80,40)),cmap='bone',vmax=.5,vmin=-.5)
-    # plt.title('Original Image')
-    # plt.subplot(2,2,2)
-    # plt.imshow(np.reshape(A@P@xsfes[:,imgNum],(80,40),order='F'),cmap='bone',vmax=.5,vmin=-.5)
-    # plt.title('SFE Reconstruction')
-    # plt.subplot(2,2,3)
-    # plt.imshow(np.reshape(A@P@xmses[:,imgNum],(80,40),order='F'),cmap='bone',vmax=.5,vmin=-.5)
-    # plt.title('MSE Reconstruction')
-    # plt.subplot(2,2,4)
-    # plt.imshow(np.reshape(A@P@xjpgs[:,imgNum],(80,40),order='F'),cmap='bone',vmax=.5,vmin=-.5)
-    # plt.title('JPG Reconstruction')
-    # plt.show()
-    return
-
-def getElecAct(eActs,xmse,xsfe,xjpg):
-    # eLocs is a 512 x 2 matrix containing (x,y) coords of 512 electrodes
-    # eActs is a 4646x2 matrix containing the electrode numbers of the 4646 dictionary elements 
-    # xmse,xsfe,xjpg are 4646 vectors contianing the amount of times each dictionary element is chosen
-    # return 512-vectors emse, esfe, ejpg which specifies the activity of each electrode, defined as
-    # the number of times that electrode is selected by the dictionary set
-
-    dictLength = xmse.shape[0]
-
-    mseAct = np.zeros((512,))
-    sfeAct = np.zeros((512,))
-    jpgAct = np.zeros((512,))
-    # for each element in dicitonary
-    for i in np.arange(dictLength):
-        # get the electrode number
-        elecNum = eActs[i,0]
-        elecIdx = elecNum -1
-        mseAct[elecIdx] += xmse[i]
-        sfeAct[elecIdx] += xsfe[i]
-        jpgAct[elecIdx] += xjpg[i]
-    return mseAct, sfeAct, jpgAct
-
-def dispFreqDiff(imgs, mseImgs, jpgImgs, imgNum):
-    imgDct = (dct2(np.reshape(imgs[:,imgNum],pixelDims,order='F')))
-    jpgDct = (dct2(np.reshape(jpgImgs[:,imgNum],pixelDims,order='F')))
-    mseDct = (dct2(np.reshape(mseImgs[:,imgNum],pixelDims,order='F')))
-
-
-    vmax = 200
-    vmin = -200
-
-    plt.subplot(131)
-    plt.imshow((imgDct),cmap='bone')
-    plt.axis('off')
-    plt.title('Original Image')
-    plt.colorbar(orientation='horizontal')
-    plt.subplot(132)
-    plt.imshow(np.divide((imgDct-mseDct),imgDct)*100,cmap='bone',vmax=vmax,vmin=vmin)
-    plt.axis('off')
-    plt.title('% Difference MSE')
-    plt.colorbar(orientation='horizontal')
-
-    plt.subplot(133)
-    plt.imshow(np.divide(jpgDct-imgDct,imgDct)*100,cmap='bone',vmax=vmax,vmin=vmin)
-    plt.title('% Difference CSF')
-    plt.colorbar(orientation='horizontal')
-
-    plt.axis('off')
-    plt.show()
-    
-def reconsImgCompar(img,mseRecons,jpgRecons,ssmRecons,saveFig):
-   #Comparison of Reconstructed Images to Original
-    vmax = .5
-    vmin = -.5
-
-    plt.figure(figsize=(10,10))
-    plt.imshow(img,cmap='bone',vmax=vmax,vmin=vmin)
-    plt.title('Original Image')
-    plt.axis('off')
-    if saveFig:
-        plt.savefig('reconsImgCompOrig.jpg',bbox_inches='tight')
-    plt.show()
-    
-    plt.figure(figsize=(10,10))
-    plt.imshow(mseRecons,cmap='bone',vmax=vmax,vmin=vmin)
-    plt.title('MSE Reconstructed Image')
-    plt.axis('off')
-    if saveFig:
-        plt.savefig('reconsImgCompMSE.jpg',bbox_inches='tight')
-    plt.show()
-
-    plt.figure(figsize=(10,10))
-    plt.imshow(jpgRecons,cmap='bone',vmax=vmax,vmin=vmin)
-    plt.title('CSF Reconstructed Image')
-    plt.axis('off')
-    if saveFig:
-        plt.savefig('reconsImgCompJPG.jpg',bbox_inches='tight')
-    plt.show()
-    
-    plt.figure(figsize=(10,10))
-    plt.imshow(ssmRecons,cmap='bone',vmax=vmax,vmin=vmin)
-    plt.title('SSIM Reconstructed Image')
-    plt.axis('off')
-    if saveFig:
-        plt.savefig('reconsImgCompSSIM.jpg',bbox_inches='tight')
-    plt.show()
-    
-def displayActDiff(imgs,mseAct,jpgAct,mseImgs,jpgImgs):
-    # Given a set of images and the corresponding cell/electrode activity of the optimal reconstructions
-    # for metrics, sort the images based on euclidean distance between  activites, display 
-    # activity differences in sorted matrix plot, and display the most different and most similar images 
-    # according to cellular activity
-    
-    angles = np.zeros((imgs.shape[1],))
-    for i in np.arange(imgs.shape[1]):
-        angles[i] = angBT(mseAct[:,i],jpgAct[:,i])
-    
-    
-    sortedIdxs = np.argsort(angles)
-    mostDiff   = sortedIdxs[-1]
-    leastDiff  = sortedIdxs[0]
-    
-    plt.plot(np.linspace(0,angles.size,angles.size),angles[sortedIdxs])
-    plt.title('Angle Between Activity Vectors')
-    plt.xlabel('Image Number')
-    plt.ylabel('Angle Between Activity Vectors (degrees)')
-    plt.ylim([0,90])
-    plt.show()
-    
-    plt.subplot(231)
-    dispImg(imgs,leastDiff)
-    plt.title('Least Different Image')
-    plt.subplot(232)
-    dispImg(mseImgs,leastDiff)
-    plt.title('MSE Reconstruction')
-    plt.subplot(233)
-    dispImg(jpgImgs,leastDiff)
-    plt.title('JPG Reconstruction')
-    plt.subplot(234)
-    dispImg(imgs,mostDiff)
-    plt.title('Most Different Image')
-    plt.subplot(235)
-    dispImg(mseImgs,mostDiff)
-    plt.title('MSE Reconstruction')
-    plt.subplot(236)
-    dispImg(jpgImgs,mostDiff)
-    plt.title('JPG Reconstruction')
-    plt.show()
-    
-    
-    return mostDiff,leastDiff
-
-def dispImg(imgs,imgNum,dct=False, pixelDims=(20,20),vmax=.5,vmin=-.5):
-    if dct:
-        D = flatDCT(pixelDims)
-        print(D.shape)
-        plt.imshow(np.reshape(D@imgs[:,imgNum],pixelDims,order='F'),cmap='bone',vmax=vmax,vmin=vmin)
-    else:
-        plt.imshow(np.reshape(imgs[:,imgNum],pixelDims,order='F'),cmap='bone',vmax=vmax,vmin=vmin)
-    plt.axis('off')
-    
 def dispElecAct(elecActs,simParams,color='blue'):
-    # Given a vector of electrode activities, a vector of (x,y) electrode locations, and a 2xnumElectrode
+    # Given a vector of electrode activities, a vector of (x,y) electrode locations, and a 2xnumElectrode (contained in simparams)
     # matrix of electrode numbers for each element, sum the total current passing through each electrode, 
     # and display it in a scatter plot
     eLocs = simParams["eLocs"]
     eMap  = simParams["eMap"]
-    
     
     totalCurr = getTotalCurr(elecActs,simParams)
     
@@ -1189,54 +927,12 @@ def dispElecAct(elecActs,simParams,color='blue'):
     plt.xlabel('Horizontal Position (um)')
     plt.ylabel('Vertical Position (um)')
     
-def getTotalCurr(elecActs,simParams):
-    # Given a vector of activities, determine the total current contained evoked by that vector
-    eLocs = simParams["eLocs"]
-    eMap  = simParams["eMap"]
-    
-    dictLength = eMap.shape[0]-1 # minus 1 because last variable is dummy zeros    
-    
-    totalCurr = np.zeros(eLocs.shape[0])
-    
-    # iterate through each element of elecActs
-    for i in np.arange(dictLength):
-        elecNum = eMap[i,0]-1
-        current = eMap[i,1]
-        totalCurr[elecNum] += current*elecActs[i]
-        
-    return totalCurr
+
 
 def angBT(vecA,vecB):
     # return the cosine of the angle between to vectors:
     ang = np.arccos(np.dot(vecA,vecB)/(np.linalg.norm(vecA)*np.linalg.norm(vecB)))
     return np.rad2deg(ang)
-
-def elecVecPlot(mseActs,jpgActs,eMap):
-    # Go through each image in the set & calculate the current difference and the angle difference.
-    # radially plot each image
-    
-    numImages =  mseActs.shape[1]
-    dictLength = eMap.shape[0]-1 # minus 1 because last variable is dummy zeros
-    currDiffs = np.zeros((numImages,))
-    angles = np.zeros((numImages,))
-    
-    for imgNum in np.arange(numImages):
-        angles[imgNum] = angBT(mseActs[:,imgNum],jpgActs[:,imgNum])
-        # sum the current of each 
-        mseCurr = np.dot(mseActs[:,imgNum],eMap[:,1])
-        jpgCurr = np.dot(jpgActs[:,imgNum],eMap[:,1])
-        currDiffs[imgNum] = (jpgCurr - mseCurr)/mseCurr
-    
-    xVals = np.multiply(np.cos(np.deg2rad(angles)),currDiffs)
-    yVals = np.multiply(np.sin(np.deg2rad(angles)),currDiffs)
-    pos = currDiffs >= 0
-    neg = currDiffs <  0
-    plt.polar(np.deg2rad(angles[pos]),np.abs(currDiffs[pos]),'ro',c='blue')
-    plt.polar(np.deg2rad(angles[neg])+np.pi,np.abs(currDiffs[neg]),'ro',c='blue')
-    
-    plt.title('Angle Between MSE & JPG Activity | Magnitude=(jpgCurr-mseCurr)/mseCurr (nC)')
-    plt.show()
-    return
 
 def rebuildImg(img,imgSet,xs,ys,pixelDims,psychParams,zeroMean=False): 
     # input params:
@@ -1311,19 +1007,19 @@ def plotStimCompar(imgData, ssData, metric, psychParams, pixelDims):
     #        ssData: Stimulation Sweep Data output from numStimSweep Function
     #        pixelDims:  the dimensions of the unflattened image (e.g. (20, 20) )
     
-    def getErr(refImg, img, metric,psychParams,pixelDims):
+    def getErr(refImg, img, metric,psychParams,pixelDims, imgData):
         # given two images, calculate the error according to the given metric
         # metric = "mse", "jpg", or "ssm"
         if metric.upper() == "MSE":
-            return mse(refImg, img)/mse(refImg,np.zeros(refImg.shape))
+            return mse(refImg, img)/mse(refImg, np.zeros(refImg.shape))
         elif metric.upper() == "WMS" :
-            return jpge(refImg, img, psychParams, pixelDims) / jpge(refImg, np.zeros(refImg.shape), psychParams, pixelDims)
+            return jpge(refImg, img, psychParams, pixelDims, imgData) / jpge(refImg, np.zeros(refImg.shape), psychParams, pixelDims, imgData)
         elif metric.upper() == "SSIM":
             return ((1-SSIM(refImg, img))/2) / ((1-SSIM(refImg,np.zeros(refImg.shape)/2)))
         else: 
             raise Exception("Bad Metric Passed to getErr")
     
-    def getErrVecs(refImg, Ts, img1, img2, img3, metric, psychParams, pixelDims):
+    def getErrVecs(refImg, Ts, img1, img2, img3, metric, psychParams, pixelDims, imgData):
         # given single images generated over numStimPoints number of stimulations, return a numStimPointsx1 vector 
         # of error of each image according to the given metric
         # img1, img2, img3:  3 numPixels x numStimPoints matrices of activity(error is calculated over pixels)
@@ -1336,9 +1032,9 @@ def plotStimCompar(imgData, ssData, metric, psychParams, pixelDims):
 
         # caclulate the error of the first set of images, computing a numStimPoints vector of errors:
         for StimIdx in np.arange(Ts.size):
-            errs1[StimIdx] = getErr(refImg,img1[:,StimIdx], metric, psychParams, pixelDims)
-            errs2[StimIdx] = getErr(refImg,img2[:,StimIdx], metric, psychParams, pixelDims)
-            errs3[StimIdx] = getErr(refImg,img3[:,StimIdx], metric, psychParams, pixelDims)
+            errs1[StimIdx] = getErr(refImg,img1[:,StimIdx], metric, psychParams, pixelDims, imgData)
+            errs2[StimIdx] = getErr(refImg,img2[:,StimIdx], metric, psychParams, pixelDims, imgData)
+            errs3[StimIdx] = getErr(refImg,img3[:,StimIdx], metric, psychParams, pixelDims, imgData)
         
         return errs1, errs2, errs3
     
@@ -1357,7 +1053,7 @@ def plotStimCompar(imgData, ssData, metric, psychParams, pixelDims):
         wmsImgs = ssData.wmsImgSet[:,:,i]
         ssmImgs = ssData.ssmImgSet[:,:,i]
         refImg = imgData.imgSet[:,i]
-        errMat1[i,:], errMat2[i,:], errMat3[i,:] = getErrVecs(refImg, Ts, mseImgs.T, wmsImgs.T, ssmImgs.T, metric, psychParams, pixelDims)
+        errMat1[i,:], errMat2[i,:], errMat3[i,:] = getErrVecs(refImg, Ts, mseImgs.T, wmsImgs.T, ssmImgs.T, metric, psychParams, pixelDims, imgData)
 
     avgs1 = np.mean(errMat1,0)
     stds1 = np.std(errMat1,0) / np.sqrt(numImgs)
@@ -1402,4 +1098,65 @@ def actHist(activity,metric,alpha):
     plt.ylabel('Number of Images',fontsize=18)
     plt.legend()
     
+def contrast(img, mode='rms'):
+    #return the contrast value of a given image. Different modes correspond to different definitions of contrast:
+    # Possible modes are: Weber, Michelson, and RMS. 
+    
+    
+    lMax = np.max(img)
+    lMin = np.min(img)
+        
+    if mode.upper() == 'WEB':
+        return (lMax-lMin)/lMin
+    
+    if mode.upper() == 'MICH':
+        return (lMax-lMin)/(lMax+lMin)
+    
+    if mode.upper() == 'RMS':
+        flatImg = img.flatten()
+        return np.std(flatImg)
+    
+def relContrast(img, refImg, mode):
+    # returns the relative contrast of an original image and its reference.
+    # relative contrast is the ratio of the image contrast with that of reference
+    return  contrast(img,mode) / contrast(refImg, mode)
+
+def getImgSetContrast(imgSet, refSet, mode):
+    # given a numPixel x numImgs set of images, and a same dimension set of reference images,
+    # determine the  relative contrast of that set averaged over all the images. 
+    # relative contrast is the ratio between img and reference contrasts
+    # return the average and standard error of the mean of the relative contrasts
+    numImgs = imgSet.shape[1]
+    relCons  = np.zeros((numImgs,))
+    for i in np.arange(numImgs):
+        #relCons[i] = relContrast(imgSet[:,i], refSet[:,i], mode)
+        relCons[i] = contrast(imgSet[:,i])
+    return np.mean(relCons), np.std(relCons)/np.sqrt(numImgs)
+
+def stimSweepContrastCompar(imgData, ssData, mode):
+    # Plot the average relative contrast between 3 sets sweeping over all number of allowed timesteps
+    Ts = ssData.Ts
+    
+    mseRelCons  = np.zeros((Ts.size,))
+    mseStds     = np.zeros(mseRelCons.shape)
+    wmsRelCons  = np.zeros((Ts.size,))
+    wmsStds     = np.zeros(mseRelCons.shape)
+    ssmRelCons  = np.zeros((Ts.size,))
+    ssmStds     = np.zeros(mseRelCons.shape)
+
+    for i, T in enumerate(Ts):
+        mseRelCons[i], mseStds[i] = getImgSetContrast(ssData.mseImgSet[i,:,:], imgData.imgSet,mode)        
+        wmsRelCons[i], wmsStds[i] = getImgSetContrast(ssData.wmsImgSet[i,:,:], imgData.imgSet,mode)        
+        ssmRelCons[i], ssmStds[i] = getImgSetContrast(ssData.ssmImgSet[i,:,:], imgData.imgSet,mode)        
+ 
+    
+    plt.errorbar(Ts,mseRelCons,yerr=(mseStds),label='MSE Contrast')
+    plt.errorbar(Ts,wmsRelCons,yerr=(wmsStds),label='wMSE Contrast')
+    plt.errorbar(Ts,ssmRelCons,yerr=(ssmStds),label='SSIM Contrast')
+    
+    plt.xlabel('Number of Allowable Spikes')
+    plt.ylabel('Average RMS Contrast')
+    plt.xscale("log")
+    plt.legend()
+
     
