@@ -102,6 +102,19 @@ def metricCompar(imgData,simParams,psychParams, electrode):
 
     print('Images rebuilt.')
     print('Simulation Complete')
+
+    sim_data = SimData()
+    sim_data.mseActs = mseActs
+    sim_data.wmsActs = wmsActs
+    sim_data.ssmActs = ssmActs
+
+    sim_data.mseImgs = mseImgs
+    sim_data.wmsImgs = wmsImgs
+    sim_data.ssmImgs = ssmImgs
+
+    sim_data.mseRecons = mseRecons
+    sim_data.wmsRecons = wmsRecons
+    sim_data.ssmRecons = ssmRecons
     
     return (
             mseImgs, wmsImgs, ssmImgs,
