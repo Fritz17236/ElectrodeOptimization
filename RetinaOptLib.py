@@ -17,13 +17,12 @@ import multiprocessing as mp
 from joblib import Parallel, delayed
 from tqdm import tqdm
 import datetime
+import pickle
 
 
 
 #  Class Declarations 
 class StimSweepData:
-        
-        
     def __init__(self):
         self.Ts        = None 
         self.mseImgSet = None 
@@ -37,6 +36,7 @@ class StimSweepData:
         self.mseRecSet = None
         self.wmsRecSet = None
         self.ssmRecSet = None
+        
 class ImageData:
     def __init__(self):
         self.numImgs    = None
@@ -47,6 +47,31 @@ class ImageData:
         self.zoomFac    = None
         self.origImg    = None
         self.selecDims  = None
+        
+class SimData:
+    def __init__(self):
+        self.mseActs = None
+        self.wmsActs = None
+        self.ssmActs = None
+
+        self.mseImgs = None
+        self.wmsImgs = None
+        self.ssmImgs = None
+
+        self.mseRecons = None
+        self.wmsRecons = None
+        self.ssmRecons = None
+        
+class RetinaData:
+    def __init__(self):
+        self.A = None
+        self.P = None
+        self.eLocs = None
+        self.eMap = None
+        self.num_pixels = None
+        self.dict_len = None
+
+
 
 def metricCompar(imgData,simParams,psychParams, electrode):
     # Compare Error Metrics Side-by-Side for the same set of images    
@@ -124,6 +149,46 @@ def loadRawImg(fName):
     img = img / np.max((np.abs(img))) 
 
     return img
+
+def save_data(data,fName):
+    # save the data structure passed to the filename given
+    sessionTitle = fName+"_"+datetime.datetime.now().strftime("%y-%m-%d_%H-%M")+'.dat'
+    with open(sessionTitle, 'wb') as fHandle:
+        pickle.dump(data, fHandle)
+        
+        
+def load_data(fName):
+    return pickle.load(open(fName,'rb'))
+
+def load_raw_data(fName):
+    # loads raw data from matlab .mat file
+    data = scipy.io.loadmat(fName)
+    A   = (data['stas'].T)
+      # Select 20x20 slice of Pixels from A to fix border issues
+    P,eMap = pruneDict(data['dictionary'].T,data['ea'])
+
+    eLocs = data['elec_loc']  # electrode locations
+    dictLength = P.shape[1]
+    numPixels = A.shape[0]
+
+    # Trim A to a 20 x 20 Square
+    Aslice = np.zeros((400,A.shape[1]))
+    for col in np.arange(8,28):
+    #     A[30+80*col:50+80*col,:] = 0
+        Aslice[(col-8)*20:(col-7)*20,:] = A[30+80*col:50+80*col,:]
+
+    A,P = pruneDecoder(Aslice,P)
+    
+    ret_data = RetinaData()
+    ret_data.A = A
+    ret_data.P = P
+    ret_data.e_locs = eLocs
+    ret_data.e_map  = eMap
+    ret_data.num_pixels = numPixels
+    ret_data.dict_len = dictLength
+    ret_data.num_cells = A.shape[1]
+    
+    return ret_data
     
 def dct2(a):
     # 2D Discrete Cosine Transform and Its Inverse
@@ -351,7 +416,8 @@ def pruneDict(P,eActs,threshold=.05):
     pp = np.delete(pp,toDel,axis=1)
     eActs = np.delete(eActs,toDel,axis=0)
     
-    return np.hstack((pp,np.zeros((pp.shape[0],1)))),  np.vstack((eActs,np.asarray(np.zeros((1,eActs.shape[1])))))
+    return pp, eActs
+    # only do if greedy: return np.hstack((pp,np.zeros((pp.shape[0],1)))),  np.vstack((eActs,np.asarray(np.zeros((1,eActs.shape[1])))))
     
 def mse(A,B):
     #flatten if not flat
@@ -533,14 +599,18 @@ def actSolver(img,imgData,simParams,psychParams,mode,electrode):
     #     simParams: the simulatin parameters dictionary object
     #     electrode: boolean indicating whether performing optimal cellular or electrode dictionary recons
     #     x : the cvx variable representing the activity vector object that is being solved for
-
+        var_mtx = variance_matrix(simParams, Phi)
+        return  cp.sum(var_mtx@x)
+    def variance_matrix(simParams, Phi):
+        # get the variance matrix that maps dictionary selections to 
+        # total variance of the reconstructed image according to the given
+        # metric, Phi
         P = simParams["P"]
         A = simParams["A"]
         V = np.zeros(P.shape)
         for j in np.arange(P.shape[1]):
             V[:,j] = np.multiply(P[:,j],(1-P[:,j]))
-        varMtx = np.multiply(Phi,Phi)@V
-        return  cp.sum(varMtx@x)
+        return np.multiply(Phi,Phi)@V
     
     def reconsSSM(img, simParams, electrode, epsilon = 10**-2):
         # use bisection search to solve for an optimal-SSIM reconstruction
@@ -559,8 +629,8 @@ def actSolver(img,imgData,simParams,psychParams,mode,electrode):
 
             if electrode:
                 x = cp.Variable(P.shape[1])
-                cost = varTerm(simParams, A , x)
                 Phi = A@P
+                cost = varTerm(simParams,Phi, x)
             else:
                 x = cp.Variable(A.shape[1])
                 cost = 1
@@ -627,7 +697,6 @@ def actSolver(img,imgData,simParams,psychParams,mode,electrode):
             return A@P@x, x
         else:
             return A@x, x
-    
     
     A = simParams["A"]
     P = simParams["P"]
@@ -926,13 +995,11 @@ def dispElecAct(elecActs,simParams,color='blue'):
     plt.axis('equal')
     plt.xlabel('Horizontal Position (um)')
     plt.ylabel('Vertical Position (um)')
-    
-
 
 def angBT(vecA,vecB):
     # return the cosine of the angle between to vectors:
     ang = np.arccos(np.dot(vecA,vecB)/(np.linalg.norm(vecA)*np.linalg.norm(vecB)))
-    return np.rad2deg(ang)
+    return ang
 
 def rebuildImg(img,imgSet,xs,ys,pixelDims,psychParams,zeroMean=False): 
     # input params:
@@ -975,7 +1042,7 @@ def rebuildImg(img,imgSet,xs,ys,pixelDims,psychParams,zeroMean=False):
     
     return recons  
 
-def actAnglePlot(mseActs,otherActs,otherMetricLabel):
+def actAnglePlot(mseActs,otherActs,otherMetricLabel,a=.5):
     # given two actLength x numImgs matrices of activity over a numImgs set of images,
     # calculate the angle between each pair of activities over all image and plot this
     # angle on a polar graph, where the radius of each data point is the sum of the 
@@ -991,10 +1058,19 @@ def actAnglePlot(mseActs,otherActs,otherMetricLabel):
     
     pos = radii >= 0
     neg = radii <  0 
+
+    avg_ang = np.mean(angles)
+    str_rads = np.linspace(0,np.max(radii),angles.size)
+
     
-    plt.polar(angles[pos],radii[pos],'ro',c='red')
-    plt.polar(angles[neg],np.abs(radii[neg]),'ro',c='blue')
-    plt.title('Angle Between MSE & '+otherMetricLabel+' Activity')
+    
+    plt.polar(avg_ang*np.ones(angles.shape),str_rads,'-',c='black',
+              linewidth=5,
+              alpha=.5)
+    plt.polar(angles[pos],radii[pos],'ro',c='red',alpha=a)
+    plt.polar(angles[neg],np.abs(radii[neg]),'ro',c='blue',alpha=a)
+    plt.title('Angle Between MSE & '+otherMetricLabel+
+              ' Activity \n Avg Angle: %i deg'%np.rad2deg(avg_ang))
     plt.show()
     return
 
@@ -1159,4 +1235,5 @@ def stimSweepContrastCompar(imgData, ssData, mode):
     plt.xscale("log")
     plt.legend()
 
+    
     
