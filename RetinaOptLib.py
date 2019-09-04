@@ -12,7 +12,7 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 import datetime
 import pickle
-
+import queue
 
 
 #  Class Declarations 
@@ -125,10 +125,10 @@ def recons_img_set(img_set, img_data, sim_params, psych_params, metric, electrod
     for i in np.arange(num_imgs):
         img_list.append(img_set[:,i])
      
-    num_cores = mp.cpu_count()-1 # leave at least one open
+
     
     # run reconstructions in parallel
-    results = np.asarray(Parallel(n_jobs=num_cores)(delayed(act_solver)(i,img_data,sim_params,psych_params,metric,electrode) for i in tqdm(img_list)))
+    results = np.asarray(Parallel(n_jobs=-2)(delayed(act_solver)(i,img_data,sim_params,psych_params,metric,electrode) for i in tqdm(img_list)))
 
     #convert results back to 2 variables separating activity and the reconstructed image
     imgs = np.zeros((num_pixels,num_imgs))
@@ -1065,29 +1065,6 @@ def plot_stim_comparison(img_data, ss_data, metric, psych_params, pixel_dims):
     plt.title(string)
     plt.ylim([0,1])
     plt.legend()
-
-def act_hist(activity,metric,alpha):
-    # given a actLength x num_imgs set of activity over num_imgs images,
-    # generate and plot a histogram of sum of activity for each image over
-    # the image set. 
-    act_sum = np.sum(activity,0)
-    bins = np.linspace(0, 3000, 100)
-    
-    if metric.upper() == "MSE":
-        label = metric + " Activity, Avg Spikes = %i" %np.mean(act_sum)
-        color = 'red'
-    elif metric.upper() == "WMSE":
-        label = metric + "Activity, Avg Spikes = %i" %np.mean(act_sum)
-        color = 'green'
-    else:
-        label = metric + "Activity, Avg Spikes = %i" %np.mean(act_sum)
-        color = 'blue'
-    plt.hist(act_sum,bins=bins,label=label,alpha=alpha,color=color)
-    plt.axvline(x=np.mean(act_sum),color=color)
-    plt.title('Histogram of Total Number of Spikes Across Image Set',fontSize=18)
-    plt.xlabel('Total Number of Spikes',fontsize=18)
-    plt.ylabel('Number of Images',fontsize=18)
-    plt.legend()
     
 def contrast(img, mode='rms'):
     #return the contrast value of a given image. Different modes correspond to different definitions of contrast:
@@ -1150,14 +1127,217 @@ def stim_sweep_contrast_compar(img_data, ss_data, mode):
     plt.legend()
 
     
+### Workspace ###
+
+class ActivityQueue:
+    # An activity queue is an int_time length queue data
+    # structure that contains a rolling window of spike
+    # times for a given cell. 
+    
+    def __init__(self, int_time):
+        self.__int_time = int_time # integration time in miliseconds
+        self.__act_queue = np.zeros((int_time,))
+        self.__firing_rate = 0     
+            
+    def get_firing_rate(self):
+        # return the firing rate for the cell defined as the sum of spiked in the window divided by the integration time
+        return self.__firing_rate / (self.__int_time / 1000)       
+            
+    def update(self, has_spiked):
+        #  dequeue oldest time bin (fifo order),
+        # if cell spiked, has_spiked=true so enqueue a 1,
+        # otherwise encode a 0
+        discard = self.__act_queue[0]
+        if has_spiked:
+            spike = 1
+        else:
+            spike = 0
+        
+        new_act = np.empty_like(self.__act_queue)
+        new_act[0:self.__int_time-1] = self.__act_queue[1:]
+        new_act[-1] = spike
+        
+        self.__act_queue = new_act
+
+        self.__firing_rate += spike
+        self.__firing_rate -= discard
+        
+    def __str__(self):
+        return str(self.__act_queue)
+
+    def get_spike_raster(self):
+        # return the vector 
+        return self.__act_queue
+        
+class RetinalCell:
+    STIMULATION_RATE = 1000 # stimulation rate in Hz (time between update calls for cells)
+    __INTEGRATION_TIME = 100  # integration time of the cell in miliseconds
+    __NUM_TIME_BINS    = int(__INTEGRATION_TIME * STIMULATION_RATE)
+    
+    __REFRACTORY_PERIOD = 1  # Refractory Period of Cells in miliseconds
+    __REFRACTORY_IDX = int(__REFRACTORY_PERIOD * STIMULATION_RATE)   # How many indices from the end correspond to __REFRACTORY_PERIOD
+
+    
+    
+    # each cell contains an activity
+    # it is either in or not in the refractory period
+    def __init__(self, cell_num, cell_type):
+        self.cell_type = cell_type
+        self.cell_num = cell_num
+        self.in_refractory = False
+        
+        self.__act_queue = ActivityQueue(self.__NUM_TIME_BINS)
+        
+    def get_firing_rate(self):
+        # return the firing rate of the cell (sum of spikes / integration time)
+        return self.__act_queue.get_firing_rate()
+    
+    def update(self,has_spiked):
+        #update the cells activity depending whether or not the cell is meant to spike
+        # if cell is in refractory period, ignore spikes
+        # assume refractory period is 1ms (1 bin), so if cell in refractory period, change cell status    
+        
+        # first update whether or not the cell is in its refractory period        
+     
+        #ignore spike if in refractory period    
+        if has_spiked and not self.in_refractory:
+            self.__act_queue.update(1)                
+            
+        elif not has_spiked and self.in_refractory:
+            self.__act_queue.update(0)
+            
+        elif not has_spiked and not self.in_refractory:
+            self.__act_queue.update(0)
+                
+        self.__update_refractory_period()
+
+    def get_spike_raster(self):
+        # return a vector of time bins representing cell activity 
+        return self.__act_queue.get_spike_raster()
+
+    def disp_info(self):
+        # self-explanatory: display cell attributes to console
+        print('Cell Number: %i'%self.cell_num)
+        print('Cell Type: '+self.cell_type)
+        print('Firing Rate: %.2f Hz'%self.get_firing_rate())
+        print('Spikes: ',self.get_spike_raster())
+        print('In Refractory: %s'%self.in_refractory)
+        
+    def __update_refractory_period(self):
+        # look at the previous activity over the cells integration window and determine if the cell 
+        # is in its refractory period
+        spike_raster = self.get_spike_raster()
+        if np.any(spike_raster[-self.__REFRACTORY_IDX:]):
+            self.in_refractory = True
+        else:
+            self.in_refractory = False
+        
+class Retina:
+    # Init (A, P, pixel_dims)
+    def __init__(self, A, P, pixel_dims):
+        
+        
+        self.__A = A
+        self.__P = P
+        self.__pixel_dims = pixel_dims
+        self.__num_cells = A.shape[1]
+        self.__dict_length = P.shape[1]
+        self.__num_pixels = pixel_dims[0]*pixel_dims[1]
+        self.__cells = np.zeros((self.__num_cells),dtype=np.object)
+        
+        self.activities = np.zeros((self.__num_cells,))
+
+        
+        # add cells 
+        for i in np.arange(self.__num_cells):
+            self.__cells[i] = RetinalCell(i,'parasol')
+   
+        
+    def __cell_update(self, cell_num, stim_vector):
+        # stimulate cell by calling update on the cell, where
+        # the argument of update is 1 with probability stim_prob
+        
+        has_spiked = np.random.binomial(1,stim_vector[cell_num])
+        self.__cells[cell_num].update(has_spiked)
+        self.activities[cell_num] = self.__cells[cell_num].get_firing_rate()
+        
+    def __get_stim_vector(self, dict_sel):  
+        # get the stimulation vector corresponding to the dictionary selection
+        return self.__P[:,dict_sel]
+          
+    def get_cell_rasters(self):
+        # get the rasters of each cell in the retina and return them as a matrix
+        rasters = np.zeros((self.__num_cells, RetinalCell.INTEGRATION_TIME))
+        for i in np.arange(self.__num_cells):
+            rasters[i,:] = self.__cells[i].get_spike_raster()
+        return rasters    
+
+    def get_image_vector(self):
+        # return the image encoded in the retina by a 
+        return self.__A@self.activities
+    
+    def display_image(self):
+        # display the image encoded in the retina
+        plt.figure()
+        img = self.get_image_vector()
+        plt.imshow(np.reshape(img,self.__pixel_dims,order='F'),cmap='bone')
+        plt.axis('off')
+        plt.show()
+
+    def stimulate(self, dict_sel):
+        # given a dictionary electrode, simulate electrode stimulation and update each cell
+        
+        # get dictionary element
+        stim_vector = self.__get_stim_vector(dict_sel)
+        
+        # TODO: Fix bug so that we can update all cells in parallel
+        #Parallel(n_jobs=4)(delayed(self.__cell_update)(cell_num, stim_vector[cell_num]) for cell_num in np.arange(self.__num_cells))
+        
+        for i in np.arange(self.__num_cells):
+            self.__cell_update(i,stim_vector)
+
+ret_data = load_raw_data('dict.mat')
+
+retina = Retina(ret_data.A, ret_data.P, (20,20))
+
+retina.stimulate(100)
+retina.stimulate(300)
+retina.stimulate(1000)
+retina.display_image()
+
+# class ElectrodeArray:
+#     # electrode locations
+#     # dictionary element currents
+#     # stimulate Retina(dictionary)
+#     # get current current
+#     pass
+class GreedyChooser:
+    pass
+    
+class Camera:
+    # receives frames in time
+    # sends frames to greedy 
+    pass
+
+
+class Device:
+    # a device is a simulation of a complete retinal prosthetic, encompassing the following:
+    # a camera to caputure the visual scene at some fixed resolution
+    # an eye imager to capture eye position used to stabilizinge the image on the retina
+    # a greedy processor that receives images and greedily stimulates the retina to reconstruct a given image
+    # a retina that contains cells that are interfaced with the electrode array
+    
+    ## time is measured in stimulations, set by RetinalCell.STIMULATION_RATE
+    STIMULATION_RATE = RetinalCell.STIMULATION_RATE
+    
+    
+    
+    def __init__(self, A, P, pixel_dims):
+        self.__Retina = Retina()
+    
 
 # greedy reconstruction (real time)
 
-# displayed image is generated by a linear mapping of cellular activities
-    # each cell contains activity for (int_time) miliseconds
-    # activity is stored as a queue
-    # at each time step, if a cell j is stimulated, the activity at that time step becomes 1 with probability p_j
-    # contains a cell_num vector refractory_cells that specify which cells cannot fire because they are in refractory period 
 
 # greedy dictionary selector 
     # at each time step, greedy receives an image, and has access to cell_activity and refractory_cells
@@ -1165,7 +1345,22 @@ def stim_sweep_contrast_compar(img_data, ss_data, mode):
     # greedy chooses the dictionary element to stimulate according to a given metric
     # greedy passes stimulation vector to cell object 
     
+
+
+## at each time step
+## get eye position
+    ## if saccade
+        ## get visual scene from camera
+        ## compute & update target image
+        ## reset retina
+    ## choose element greedily according to metric
+    ## stimulate electrode array for retina
+        
    
+
+## compute optimal image
+
+## given preceding image
     
     
 
