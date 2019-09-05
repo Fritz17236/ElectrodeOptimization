@@ -7,13 +7,12 @@ import scipy.io
 from scipy import ndimage
 import cvxpy as cp
 import copy
-import multiprocessing as mp
 from joblib import Parallel, delayed
 from tqdm import tqdm
 import datetime
 import pickle
-import queue
-
+import cv2
+import time
 
 #  Class Declarations 
 class StimSweepData:
@@ -62,34 +61,33 @@ class RetinaData:
         self.P = None
         self.e_locs = None
         self.e_map = None
-        self.num_pixels = None
+        self.num_stixels = None
         self.dict_len = None
 
-def metric_compar(img_data,sim_params,psych_params, electrode):
+def metric_compar(img_data, params):
     # Compare Error Metrics Side-by-Side for the same set of images    
     img    = img_data.orig_img
     img_set = img_data.img_set
     xs     = img_data.xs
     ys     = img_data.ys
     
-    if electrode:
+    if params.electrode:
         print('Solving for Electrode Activities...')
     else:
         print('Solving for Cellular Activities...')    
     
     print('MSE Activity Reconsruction:')
-    imgs_mse, acts_mse = recons_img_set(img_set,img_data, sim_params, psych_params, "mse", electrode)
+    imgs_mse, acts_mse = recons_img_set(img_set,img_data, params, "mse")
     print('wMSE Activity Reconstruction')
-    imgs_wms, acts_wms = recons_img_set(img_set,img_data, sim_params, psych_params, "wms", electrode)
+    imgs_wms, acts_wms = recons_img_set(img_set,img_data, params, "wms")
     print('SSIM Activity Reconstruction')
-    imgs_ssm, acts_ssm = recons_img_set(img_set,img_data, sim_params, psych_params, "ssm", electrode)
+    imgs_ssm, acts_ssm = recons_img_set(img_set,img_data, params, "ssm")
     
     print('Activities Solved. Rebuilding Images ...')
-    pixel_dims = sim_params["pixel_dims"]
     
-    recons_mse = rebuild_img(img,imgs_mse,xs,ys,pixel_dims,psych_params)
-    recons_wms = rebuild_img(img,imgs_wms,xs,ys,pixel_dims,psych_params)
-    recons_ssm = rebuild_img(img,imgs_ssm,xs,ys,pixel_dims,psych_params)
+    recons_mse = rebuild_img(img,imgs_mse,xs,ys,params)
+    recons_wms = rebuild_img(img,imgs_wms,xs,ys,params)
+    recons_ssm = rebuild_img(img,imgs_ssm,xs,ys,params)
 
     print('Images rebuilt.')
     print('Simulation Complete')
@@ -109,29 +107,25 @@ def metric_compar(img_data,sim_params,psych_params, electrode):
     
     return sim_data
     
-def recons_img_set(img_set, img_data, sim_params, psych_params, metric, electrode):
+def recons_img_set(img_set, img_data, params, metric):
     # Given a set of images (img_set) as a 2d Matrix, and a metric, reconstruct
     # the image set according to the given image in parallel according to the available cpu cores    
-    if electrode:
-        activity_length = sim_params["P"].shape[1]
+    if params.electrode:
+        activity_length = params.P.shape[1]
     else:
-        activity_length = sim_params["A"].shape[1]
+        activity_length = params.A.shape[1]
     
-    num_pixels = img_set.shape[0]
-    num_imgs   = img_set.shape[1]
+    num_imgs   = img_data.num_imgs
     
     # convert img_set to list for parallelization
     img_list = []
     for i in np.arange(num_imgs):
         img_list.append(img_set[:,i])
      
-
-    
     # run reconstructions in parallel
-    results = np.asarray(Parallel(n_jobs=-2)(delayed(act_solver)(i,img_data,sim_params,psych_params,metric,electrode) for i in tqdm(img_list)))
-
+    results = np.asarray(Parallel(n_jobs=-2)(delayed(act_solver)(i,img_data, params,metric) for i in tqdm(img_list)))
     #convert results back to 2 variables separating activity and the reconstructed image
-    imgs = np.zeros((num_pixels,num_imgs))
+    imgs = np.zeros((params.num_stixels,num_imgs))
     acts = np.zeros((activity_length,num_imgs))
     for i in np.arange(num_imgs):
         imgs[:,i] = results[i,0]
@@ -148,7 +142,7 @@ def load_raw_img(file_name):
     img -= np.mean(img)
     img = img / (2*np.max((np.abs(img))) ) 
 
-    return img
+    return img.T
 
 def save_data(data,file_name):
     # save the data structure passed to the filename given
@@ -169,7 +163,7 @@ def load_raw_data(file_name):
 
     e_locs = data['elec_loc']  # electrode locations
     dictLength = P.shape[1]
-    num_pixels = A.shape[0]
+    num_stixels = A.shape[0]
 
     # Trim A to a 20 x 20 Square
     Aslice = np.zeros((400,A.shape[1]))
@@ -183,7 +177,7 @@ def load_raw_data(file_name):
     ret_data.P = P
     ret_data.e_locs = e_locs
     ret_data.e_map  = e_map
-    ret_data.num_pixels = num_pixels
+    ret_data.num_stixels = num_stixels
     ret_data.dict_len = dictLength
     ret_data.num_cells = A.shape[1]
     
@@ -251,15 +245,15 @@ def gen_stixel( height, width, s ):
         img[img <= 0 ] = -.5
     return img
 
-def flat_DCT(pixel_dims):
-    # build and return a flattened dct matrix specifically for (80,40) images flattened with fortran ordering
+def flat_DCT(dims):
+    # build and return a flattened dct matrix specifically for (dim0,dim1) images flattened with fortran ordering
     # Build 80 x 40 2D DCT-II Matrix
-    num_pixels = pixel_dims[0]*pixel_dims[1]
+    num_pixels = dims[0]*dims[1]
     D1 = np.zeros((num_pixels,num_pixels))
     D2 = np.zeros((num_pixels,num_pixels))
     # build a flattened form of a  1d DCT matrix 
-    l_dim = pixel_dims[0]
-    r_dim = pixel_dims[1]
+    l_dim = dims[0]
+    r_dim = dims[1]
     n, k = np.ogrid[1:2*l_dim+1:2, :l_dim]
     m, l = np.ogrid[1:2*r_dim+1:2, :r_dim]
     Dl = 2 * np.cos(np.pi/(2*l_dim) * n * k)
@@ -277,109 +271,109 @@ def flat_DCT(pixel_dims):
     for i in np.arange(r_dim):
         for k in np.arange(l_dim):
             for j in np.arange(r_dim):
-                D2[k+j*pixel_dims[0],i*pixel_dims[0]+k] = Dr[i,j]
+                D2[k+j*dims[0],i*dims[0]+k] = Dr[i,j]
     D = D2@D1
     return D
 
-def flatW(psych_params,pixel_dims,img_data): 
+def flatW(params,img_data): 
     # build and return a flattned W matrix for images (img) flattned with fortran ordering
     # (1/2) * N / D where D is horizontal degrees, N is number of blocks 
-    XO = psych_params["XO"]
+    vis_ang_horz = params.vis_ang_horz
     N  =  int(img_data.orig_img.shape[0]/img_data.selec_dims[0]) # number of selection blocks (number of samples of DC terms of each subImage)
-    offset = (1/2) * (N / XO)
-    Wp = csf(psych_params,pixel_dims,offset=offset) #offset frequency b
-    flatW = np.reshape(Wp,(pixel_dims[0]*pixel_dims[1],),order='F')
+    offset = (1/2) * (N / vis_ang_horz)
+    Wp = csf(params,offset=offset) #offset frequency b
+    flatW = np.reshape(Wp,(params.stixel_dims[0]*params.stixel_dims[1],),order='F')
     W = np.diag(flatW)
     return W
 
-def csf(psych_params,pixel_dims,offset=0):
+def csf(params,offset=0):
     # given a peak sensitivity frequency pf, and a psychophysically determined pixels-per-degree of viusal field ppd,
     # and and image, return a mask that has the same shape as the image and applies a weighting to each pixel in the image
     # according to the contrast sensitivity function 
-    def getNg(psych_params):
-        e = psych_params["e"]
-        Ng0 = psych_params["Ng0"]
-        eg = psych_params["eg"]
+    def getNg(params):
+        e = params.e
+        Ng0 = params.Ng0
+        eg = params.eg
         term1 = .85 / (1 + (e/.45)**2)
         term2 = .15 / (1 + (3/eg)**2)
         return Ng0*term1*term2
     
-    def Mopt(f,psych_params):
+    def Mopt(f,params):
         #given a spatial frequency f and psychophysical parameters,
         # return the frequnecy filetered by the optical transfer function
         # of the retina
         sigma00 = .30           # Non-retinal optical linespread constant (arcmin)
-        sigmaRet = 1 / np.sqrt(7.2*np.sqrt(3)*getNg(psych_params))
+        sigmaRet = 1 / np.sqrt(7.2*np.sqrt(3)*getNg(params))
         sigma_0 = np.sqrt(sigma00**2 + sigmaRet**2) # (arcmin) std deviation of linespread (function of eccentricity)
         Cab = .08    # (arcmin / mm ) dimensionality constant
-        d = psych_params["d"] # pupil size in mm
+        d = params.pupil_diam # pupil size in mm
         sigma = np.sqrt(sigma_0**2 + (Cab*d)**2)
         return np.exp(-2*(np.pi**2)*((sigma/60)**2)*(f**2))
         
-    def intTerm(f,psych_params):
+    def intTerm(f,params):
         # given spatial frequency f and psychophysical paratmeters,
         # calculate the visual-angle integration term of the CSF
-        e = psych_params["e"]
+        e = params.e
         Xmax = 12   # (degrees) maximum visual integration area  
         term1 = .85 / (1 + (e/4)**2)
         term2 = .15 / (1 + (e/12)**2)
         Xmax=Xmax*(term1+term2)**-.5
         Ymax = Xmax
         Nmax = 15  # (cycles) maximum number of cycles function of eccentriicty
-        XO = psych_params["XO"]
-        YO = psych_params["YO"]
+        vis_ang_horz = params.vis_ang_horz
+        vis_ang_vert = params.vis_ang_vert
         
-        term1 = (.5*XO)**2 + 4*e**2
-        term2 = (.5*XO)**2 + e**2
+        term1 = (.5*vis_ang_horz)**2 + 4*e**2
+        term2 = (.5*vis_ang_horz)**2 + e**2
         NmaxFac = term1/term2
         
-        return 1/(XO*YO) + 1/(Xmax*Ymax) + NmaxFac*(f/Nmax)**2
+        return 1/(vis_ang_horz*vis_ang_vert) + 1/(Xmax*Ymax) + NmaxFac*(f/Nmax)**2
     
-    def illumTerm(psych_params):
+    def illumTerm(params):
         #given spatial frequency f and psychophysical parameters,
         # calculate the  illumance term of the CSF
         n = .03  #quantum efficiency term (function of eccentricity)
-        e = psych_params["e"]
+        e = params
         term1 = .4 / (1 + (e/7)**2)
         term2 = .48 / (1 + (e/20)**2) 
         n = n*(term1 + term2 +.12)
         p = 1.24 # photon conversion factor (function of incident light)
-        d = psych_params["d"]
-        L = psych_params["L"]
+        d = params.pupil_diam
+        L = params.L
         E = np.pi/4 * d**2 * L * (1 - (d/9.7)**2 + (d/12.4)**4)
         return 1/(n*p*E)
         
-    def inhibTerm(f,psych_params):
+    def inhibTerm(f,params):
         # given spatial frequency f and psychophysical parameters,
         # calculate the lateral inhibition term of the CSF
-        Ng0 = psych_params["Ng0"]
-        e = psych_params["e"]
+        Ng0 = params.Ng0
+        e = params.e
         u0 = 7  #(cycles/deg) stop frequency of lateral inhibition
         term1 = .85 / (1 + (e/4)**2)
         term2 = .13 / (1 + (e/20)**2)
-        u0 = u0 * (getNg(psych_params)/Ng0)**.5 * (term1 + term2 + .02)**-.5
+        u0 = u0 * (getNg(params)/Ng0)**.5 * (term1 + term2 + .02)**-.5
         return 1 - np.exp(-(f/u0)**2)
     
-    k  = psych_params["k"]
-    X0 = psych_params["elec_XO"]
-    T  = psych_params["T"]
-    sfRes = 1/pixel_dims[0]
-    Ng = getNg(psych_params)
-    Ng0 = psych_params["Ng0"]
+    k  = params.k
+    X0 = params.elec_ang_horz
+    T  = params.num_stims
+    sf_res = 1/params.stixel_dims[0]
+    Ng = getNg(params)
+    Ng0 = params.Ng0
     ph0= 3*10**-8*Ng0/Ng  # neural noise term (sec / deg^2)
-    fxx,fyy = np.meshgrid(np.arange(pixel_dims[1]),np.arange(pixel_dims[0]))
-    ppd = pixel_dims[0]/X0
-    fs = (sfRes * ppd *((fxx)**2+(fyy)**2)**.5  ) + offset
+    fxx,fyy = np.meshgrid(np.arange(params.stixel_dims[1]),np.arange(params.stixel_dims[0]))
+    ppd = params.stixel_dims[0]/X0
+    fs = (sf_res * ppd *((fxx)**2+(fyy)**2)**.5  ) + offset
     
-    num   = Mopt(fs,psych_params) / k
+    num   = Mopt(fs, params) / k
     
-    if not psych_params["binocular"]:
+    if not params.binocular:
         num = num /  np.sqrt(2)
     
     denom = np.sqrt( 
         (2/T)
-        *intTerm(fs,psych_params)
-        *(illumTerm(psych_params) + ph0 / inhibTerm(fs,psych_params)) 
+        *intTerm(fs,params)
+        *(illumTerm(params) + ph0 / inhibTerm(fs,params)) 
     )
     W = np.divide(num,denom)
     return W
@@ -427,17 +421,17 @@ def mse(A,B):
     else:
         return (A-B).T@(A-B)/A.size
 
-def jpge(A,B,psych_params,pixel_dims, img_data):
+def jpge(A,B,params, img_data):
     try:
-        D = flat_DCT(pixel_dims)
+        D = flat_DCT(params.stixel_dims)
         diffImg = A - B
         if diffImg.ndim is not 1: #flatten image if not already flattened
             diffImg = diffImg.flatten
-        W = flatW(psych_params, pixel_dims, img_data)
+        W = flatW(params, img_data)
         W = W/np.max(W)
         return np.linalg.norm(W@D@diffImg)**2 / A.size
     except:
-        W = csf(psych_params, pixel_dims)
+        W = csf(params)
         W = W/np.max(W)
         return np.linalg.norm(np.multiply(W,dct2(diffImg))) 
 
@@ -470,161 +464,163 @@ def SSIM(X, Y, K1=.01, K2=.03, alpha=1, beta=1, gamma=1, L=1 ):
     ssim = lum**alpha * con**beta * srt**gamma
     return ssim
 
-def get_elec_angs(smps,stixelSize, eyeDiam, pixel_dims):
+def get_elec_angs(stixel_dims, smps, stixel_size, eye_diam):
     # Given a set of psychophysical parameters,the reconstructing electrode array
     # smps: stimulus monitor pixel size: the size of a single monitor pixel in lab setup on the retina (microns)
     # stixelSize:  the stixel size,which is the square root of the number of monitor pixels grouped together 
     #      to form a single STA pixel (one STA pixel is stixelSize x stixelSize monitor pixels)
     # eyeDiam: the Emmetropia diameter of the eye in milimeters
         
-    
     retArea  = ( # Retinal area in milimeters
-        pixel_dims[0]*smps*stixelSize/1000,
-        pixel_dims[1]*smps*stixelSize/1000
+        stixel_dims[0]*smps*stixel_size/1000,
+        stixel_dims[1]*smps*stixel_size/1000
     )
     
     elecVisAng = ( # Visual Angle Spanned by the Electrode Reconstruction 
-        np.rad2deg(np.arctan(retArea[0]/eyeDiam)),
-        np.rad2deg(np.arctan(retArea[1]/eyeDiam))
+        np.rad2deg(np.arctan(retArea[0]/eye_diam)),
+        np.rad2deg(np.arctan(retArea[1]/eye_diam))
     )
     
     return elecVisAng
 
-def preprocess_img(img,psych_params,sim_params):
+def preprocess_img(img,params):
     # Given psychophysically determined viewing angles for the visual
     # scene, the image, and the dimensions of the stimulus reconstruction in 
     # pixels, tile the image into a set of subimages, where each subimage
     # covers precisely elecVisAng[0] x elecVisAng[1] degrees of the visual
     # scene. Resample these tiled images to have the same dimensions as the 
-    # stimulus pixel (pixel_dims) for reconstruction.
+    # stimulus pixel (stixel_dims) for reconstruction.
     # elecVisAng[0]/objVisAngle[0] = selection/  img.shape[0]
     
-    def tileImage(img,pixel_dims):
-        # Given an mxn image and pixel_dims, tile the image by splitting it into 
-        # num_imgs subimages obtained by taking pieces of size pixel_dims from the original image, stacking,
+    def tileImage(img,stixel_dims):
+        # Given an mxn image and stixel_dims, tile the image by splitting it into 
+        # num_imgs subimages obtained by taking pieces of size stixel_dims from the original image, stacking,
         # and then returning the images, as well as the x & y locations of the top left corner of each image
         
-        def fitToDims(img,pixel_dims):
+        def fitToDims(img,stixel_dims):
             # Given an mxn image, fit the image to the given dimension by padding it with zeros. 
             # This imamge assumes m<= pixelDIms[0] and/or n <= pxiel_dims[1]
-            fitImg = np.zeros(pixel_dims)
+            fitImg = np.zeros(stixel_dims)
             fitImg[0:img.shape[0],0:img.shape[1]] = img
             return fitImg       
         
         print('Tiling Image ...')
         x = 0
         y = 0 # initial location is top left of image
-        subImgs = np.zeros((pixel_dims[0]*pixel_dims[1],0))
+        subImgs = np.zeros((stixel_dims[0]*stixel_dims[1],0))
         xs = np.asarray([])
         ys = np.asarray([])
 
-        while y <= img.shape[1]-pixel_dims[1]:
+        while y <= img.shape[1]-stixel_dims[1]:
             # sweep horizontally. if x >= img.shape set x to 0 and update y
-            if x >= img.shape[0]-pixel_dims[0]: 
+            if x >= img.shape[0]-stixel_dims[0]: 
                 x = 0
-                y += int(pixel_dims[0])
+                y += int(stixel_dims[0])
 
-            selection = fitToDims(img[x:x+pixel_dims[0],y:y+pixel_dims[1]],pixel_dims)
-            selection = np.reshape(selection,(pixel_dims[0]*pixel_dims[1],1),order='F')
+            selection = fitToDims(img[x:x+stixel_dims[0],y:y+stixel_dims[1]],stixel_dims)
+            selection = np.reshape(selection,(stixel_dims[0]*stixel_dims[1],1),order='F')
             if not np.all(selection==0):
                 subImgs = np.concatenate((subImgs,selection),1)
                 xs = np.append(xs,[x])
                 ys = np.append(ys,[y])
-                x += int(pixel_dims[0])
+                x += int(stixel_dims[0])
 
         print('Tiled Image')        
         return subImgs, xs, ys
 
-    pixel_dims = sim_params["pixel_dims"]
-    selec_dims = get_selection_dims(psych_params,img)
+    
+    selec_dims = get_selection_dims(params, img.shape)
 
     img_set, xs, ys        = tileImage(img,selec_dims)
 
     num_imgs = img_set.shape[1]
-    resImgSet = np.zeros((pixel_dims[0]*pixel_dims[1],num_imgs))
+    img_set_res = np.zeros((params.stixel_dims[0]*params.stixel_dims[1],num_imgs))
 
-    # go through each image, resample it and store it in resImgSet
+    # go through each image, resample it and store it in img_set_res
     for i in np.arange(num_imgs):
-        resImgSet[:,i],zoomF = resample(img_set[:,i],selec_dims,pixel_dims)
+        img_set_res[:,i] = resample(img_set[:,i],selec_dims,params.stixel_dims)
     img_data = ImageData()
     img_data.num_imgs = num_imgs
-    img_data.img_set = resImgSet
+    img_data.img_set = img_set_res
     img_data.xs = xs
     img_data.ys = ys
-    img_data.zoomFac = zoomF
     img_data.orig_img    = img
     img_data.selec_dims      = selec_dims
-    img_data.resampled_img = rebuild_img(img, resImgSet, xs, ys, pixel_dims, psych_params)
+    img_data.resampled_img = rebuild_img(img, img_set_res, xs, ys, params)
     
     return img_data
 
-def get_selection_dims(psych_params,img):
-    XO = psych_params['XO']
-    elec_XO = psych_params['elec_XO']
-    selectionSize = int(np.ceil(elec_XO/XO * img.shape[1]))
+def get_selection_dims(params,img_dims):
+    vis_ang_horz = params.vis_ang_horz
+    
+    elec_ang_horz = params.elec_ang_horz
+    elec_ang_vert = params.elec_ang_vert
+    
+    selection_size_x = int(np.ceil(elec_ang_horz/vis_ang_horz * img_dims[0]))
+    selection_size_y = int(np.ceil(elec_ang_vert/vis_ang_horz * img_dims[0]))
 
     # select the equivalent of elecVisangx elecVisAng pixels from the image
-    selec_dims = (selectionSize,selectionSize)
+    selec_dims = (selection_size_x,selection_size_y)
     return selec_dims
 
-def act_solver(img,img_data,sim_params,psych_params,mode,electrode):
+def act_solver(img,img_data,params,mode):
     # Reconstruct an image according to the error metric specified by "mode"
-    # Input: img : the image to be reconstructed, dims = psych_params["pixel_dims"]
+    # Input: img : the image to be reconstructed, dims = psych_params["stixel_dims"]
     #        sim_params : a simulation parameters dictionary 
     #        psych_params: a psychophysical parameters dictionary
     #        mode : a string specifying the particular error metric being used
     #        electrode : a boolean specifying whether to reconstruct according ot optimal cell 
                 # activities or using th electrode stimulation dictionary 
     #Subfunctions:
-    def var_term(sim_params,Phi, x):
+    def var_term(params,phi, x):
     # Return the cost function associate with the variance component of the reconstruction
     # error. Only used in the case that electrode is true
     # Inputs: 
     #     sim_params: the simulatin parameters dictionary object
     #     electrode: boolean indicating whether performing optimal cellular or electrode dictionary recons
     #     x : the cvx variable representing the activity vector object that is being solved for
-        var_mtx = variance_matrix(sim_params, Phi)
+        var_mtx = variance_matrix(params, phi)
         return  cp.sum(var_mtx@x)
-    def variance_matrix(sim_params, Phi):
+    def variance_matrix(params, phi):
         # get the variance matrix that maps dictionary selections to 
         # total variance of the reconstructed image according to the given
-        # metric, Phi
-        P = sim_params["P"]
+        # metric, phi
+        P = params.P
         V = np.zeros(P.shape)
         for j in np.arange(P.shape[1]):
             V[:,j] = np.multiply(P[:,j],(1-P[:,j]))
-        return np.multiply(Phi,Phi)@V
+        return np.multiply(phi,phi)@V
     
-    def recons_ssm(img, sim_params, electrode, epsilon = 10**-2):
+    def recons_ssm(img, params, epsilon = 10**-2):
         # use bisection search to solve for an optimal-SSIM reconstruction
 
-        def find_feasible(y,alpha,sim_params, electrode ):
+        def find_feasible(y,alpha, params ):
             # Return a feasible solution to the SSIM optimization problem
             # Using cvxpy solves the constrained feasability problem that is a transformation of the SSIM
             # optimization problem.
 
-            def cvxineq(a,y,x,Phi):
+            def cvxineq(a,y,x,phi):
                 # a convex inequality to evaluate feasability
-                return (1-a)*cp.sum_squares(y-Phi@x)-2*a*(Phi@x).T@y
+                return (1-a)*cp.sum_squares(y-phi@x)-2*a*(phi@x).T@y
 
-            A = sim_params["A"]
-            P = sim_params["P"]
+            A = params.A
+            P = params.P
 
-            if electrode:
+            if params.electrode:
                 x = cp.Variable(P.shape[1])
-                Phi = A@P
-                cost = var_term(sim_params,Phi, x)
+                phi = A@P
+                cost = var_term(params ,phi, x)
             else:
                 x = cp.Variable(A.shape[1])
                 cost = 1
-                Phi = A
+                phi = A
 
-            T = sim_params["num_stims"]
-            N = sim_params["max_act"]
+            T = params.num_stims
+            N = params.max_act
             if T == -1:
-                constraints = [x <= N, x >= 0, cvxineq(alpha,y,x,Phi) <= 0]
+                constraints = [x <= N, x >= 0, cvxineq(alpha,y,x,phi) <= 0]
             else:
-                constraints = [x <= N, x >= 0, cvxineq(alpha,y,x,Phi) <= 0, cp.sum(x) <= T]
+                constraints = [x <= N, x >= 0, cvxineq(alpha,y,x,phi) <= 0, cp.sum(x) <= T]
 
             prob= cp.Problem(cp.Minimize(cost),constraints)
             try:
@@ -637,12 +633,12 @@ def act_solver(img,img_data,sim_params,psych_params,mode,electrode):
             else:
                 return False, x.value
 
-        A = sim_params["A"]
-        P = sim_params["P"]
-        if electrode:
-            actLength = P.shape[1]
+        A = params.A
+        P = params.P
+        if params.electrode:
+            act_length = P.shape[1]
         else:
-            actLength = A.shape[1]
+            act_length = A.shape[1]
 
 
         # image preprocessing 
@@ -653,20 +649,20 @@ def act_solver(img,img_data,sim_params,psych_params,mode,electrode):
         l = 0 # lower bound
         u = 2 # upper bound
         e = epsilon  # accuracy
-        x = np.zeros(actLength) # solution
-        xCurr = np.zeros(actLength) # temporary solution
+        x = np.zeros(act_length) # solution
+        xCurr = np.zeros(act_length) # temporary solution
 
         # bisection search
         while u - l >= e:
             alpha = (l+u)/2
             # find feasible x   let u = alpha
-            isFeasible, xCurr = find_feasible(y, alpha, sim_params, electrode)
+            isFeasible, xCurr = find_feasible(y, alpha, params)
 
             if isFeasible:
                 u = alpha
             elif alpha == 1:
                 print('SSIM reconstruction cannot be solved.')
-                if electrode:
+                if params.electrode:
                     return 0*A@P@x, 0*x
                 else:
                     return 0*A@x, 0*x
@@ -676,35 +672,34 @@ def act_solver(img,img_data,sim_params,psych_params,mode,electrode):
             if xCurr is not None: # only overwrite x is new value is generated
                 x = copy.deepcopy(xCurr)            
         x = np.rint(x)
-        if electrode:
+        if params.electrode:
             return A@P@x, x
         else:
             return A@x, x
     
-    A = sim_params["A"]
-    P = sim_params["P"]
-    T = sim_params["num_stims"]
-    N = sim_params["max_act"]
-    pixel_dims = sim_params["pixel_dims"]
+    A = params.A
+    P = params.P
+    T = params.num_stims
+    N = params.max_act
 
     y = img
 
-    if electrode:
+    if params.electrode:
         x = cp.Variable(P.shape[1])
     else:
         x = cp.Variable(A.shape[1])
 
     if mode == "mse": 
-        if electrode:
-            cost = cp.sum_squares(y-A@P@x) + var_term(sim_params,A,x)
+        if params.electrode:
+            cost = cp.sum_squares(y-A@P@x) + var_term(params,A,x)
         else:
             cost = cp.sum_squares(y-A@x)
     
     elif mode == "wms":
-        W = flatW(psych_params,sim_params["pixel_dims"],img_data)
-        D = flat_DCT(pixel_dims)
-        if electrode:
-            cost = cp.sum_squares(W@D@(y-A@P@x)) + var_term(sim_params, W@D@A, x)
+        W = flatW(params,img_data)
+        D = flat_DCT(params.stixel_dims)
+        if params.electrode:
+            cost = cp.sum_squares(W@D@(y-A@P@x)) + var_term(params, W@D@A, x)
         else:
             try:
                 cost = cp.sum_squares(W@D@(y-A@x))
@@ -717,7 +712,7 @@ def act_solver(img,img_data,sim_params,psych_params,mode,electrode):
             
     elif mode == "ssm": 
         # custom SSIM bisection search solver
-        return recons_ssm(img, sim_params, electrode)
+        return recons_ssm(img, params)
         
     # Solve cost function and return x's value and the reconstructed image
     if T == -1:
@@ -730,7 +725,7 @@ def act_solver(img,img_data,sim_params,psych_params,mode,electrode):
     except:
         prob.solve(solver=cp.SCS)
     
-    if electrode:
+    if params.electrode:
         return A@P@x.value, x.value
     else:
         try:
@@ -796,18 +791,25 @@ def num_stim_sweep(img_data,sim_params,psych_params,electrode):
         
     return ss_data
 
-def resample(img,curr_dims,desiredDims):
+def resample(img,curr_dims, desiredDims, return_flat = True):
+    
     # given a (curr_dims[0]*curr_dims[1] x 1 ) image vector, resample the image
     # to fit to desired dims and return this image flatted into a 
     #(desiredDims[0],desiredDims[1] x 1) image vector
-    currImg = np.reshape(img,curr_dims,order='F')
-
+    
+    # if image flat, reshape
+    if img.ndim == 1:
+        img = np.reshape(img,curr_dims,order='F')
+    
     # desiredDims[0] = zoomFac * curr_dims[0]
     zoomFac =  desiredDims[0]/curr_dims[0]
-    zImg = ndimage.zoom(currImg,zoomFac)
-    return np.reshape(zImg,(desiredDims[0]*desiredDims[1],),order='F'),zoomFac
+    zImg = ndimage.zoom(img,zoomFac)
+    if return_flat:
+        return np.reshape(zImg,(desiredDims[0]*desiredDims[1],),order='F')
+    else:
+        return zImg
 
-## Visulization Functions
+## Visualization Functions
 
 def pca_analysis(imgs,acts_mse,acts_wms, acts_ssm):
     # given a set of images, electrode locations, and their dictionary reconstructions,
@@ -915,7 +917,7 @@ def angle_between(vecA,vecB):
     ang = np.arccos(np.dot(vecA,vecB)/(np.linalg.norm(vecA)*np.linalg.norm(vecB)))
     return ang
 
-def rebuild_img(img,img_set,xs,ys,pixel_dims,psych_params,zeroMean=False): 
+def rebuild_img(img,img_set,xs,ys,params,zeroMean=False): 
     # input params:
     # img: an mxn original image matching the desired image dimensions
     # img_set a (num_pixels x num_imgs) matrix of flattened subimages
@@ -930,17 +932,17 @@ def rebuild_img(img,img_set,xs,ys,pixel_dims,psych_params,zeroMean=False):
     ys = ys.astype(int)
     
     #calc selection dims
-    selec_dims = get_selection_dims(psych_params,img)
+    selec_dims = get_selection_dims(params,img.shape)
     # iterate through each (x,y) coordinate a
     for i in np.arange(xs.shape[0]): 
         # if dims not correct, resample to selectiondims
-        if (pixel_dims[0] != selec_dims[0] or pixel_dims[1] != selec_dims[1]):
+        if (params.stixel_dims[0] != selec_dims[0] or params.stixel_dims[1] != selec_dims[1]):
             # resample image
-            resampled_img = resample(img_set[:,i],pixel_dims,selec_dims)[0]
-            
-        reconsImg = np.reshape(resampled_img,selec_dims,order='F')
+            resampled_img = resample(img_set[:,i],params.stixel_dims,selec_dims)
+            reconsImg = np.reshape(resampled_img,selec_dims,order='F')
         
-
+        else:
+            reconsImg = np.reshape(img_set[:,i],selec_dims,order='F')
         # only add to image if exactly zero pixel
         x = xs[i]
         y = ys[i]
@@ -957,7 +959,7 @@ def rebuild_img(img,img_set,xs,ys,pixel_dims,psych_params,zeroMean=False):
     return recons  
 
 def act_angle_plot(acts_mse, other_acts, other_label, r_lim, a=.5):
-    # given two actLength x num_imgs matrices of activity over a num_imgs set of images,
+    # given two act_length x num_imgs matrices of activity over a num_imgs set of images,
     # calculate the angle between each pair of activities over all image and plot this
     # angle on a polar graph, where the radius of each data point is the sum of the 
     # activity of the other activity minus the sum of the MSE activity.
@@ -989,28 +991,28 @@ def act_angle_plot(acts_mse, other_acts, other_label, r_lim, a=.5):
               ' Activity \n Avg Angle: %i deg'%np.rad2deg(avg_ang))
     return
 
-def plot_stim_comparison(img_data, ss_data, metric, psych_params, pixel_dims):
+def plot_stim_comparison(img_data, ss_data, metric, psych_params, stixel_dims):
     # plot the error of given image sets versus number of stimulations according to  a specified metric, average over
     #  all images for each number of stimulations data point
     # Input: img_data: img_data object created by preprocess_img function
     #        metric: metric according to which activities 1 and 2 will be plotted/calculated: "mse", "wms", or "ssm"
     #        psych_params: a psychophysical parameters object 
     #        ss_data: Stimulation Sweep Data output from num_stim_sweep Function
-    #        pixel_dims:  the dimensions of the unflattened image (e.g. (20, 20) )
+    #        stixel_dims:  the dimensions of the unflattened image (e.g. (20, 20) )
     
-    def get_error(ref_img, img, metric,psych_params,pixel_dims, img_data):
+    def get_error(ref_img, img, metric,psych_params,stixel_dims, img_data):
         # given two images, calculate the error according to the given metric
         # metric = "mse", "jpg", or "ssm"
         if metric.upper() == "MSE":
             return mse(ref_img, img)/mse(ref_img, np.zeros(ref_img.shape))
         elif metric.upper() == "WMS" :
-            return jpge(ref_img, img, psych_params, pixel_dims, img_data) / jpge(ref_img, np.zeros(ref_img.shape), psych_params, pixel_dims, img_data)
+            return jpge(ref_img, img, psych_params, stixel_dims, img_data) / jpge(ref_img, np.zeros(ref_img.shape), psych_params, stixel_dims, img_data)
         elif metric.upper() == "SSIM":
             return ((1-SSIM(ref_img, img))/2) / ((1-SSIM(ref_img,np.zeros(ref_img.shape)/2)))
         else: 
             raise Exception("Bad Metric Passed to get_error")
     
-    def get_error_vecs(ref_img, Ts, img1, img2, img3, metric, psych_params, pixel_dims, img_data):
+    def get_error_vecs(ref_img, Ts, img1, img2, img3, metric, psych_params, stixel_dims, img_data):
         # given single images generated over numStimPoints number of stimulations, return a numStimPointsx1 vector 
         # of error of each image according to the given metric
         # img1, img2, img3:  3 num_pixels x numStimPoints matrices of activity(error is calculated over pixels)
@@ -1023,9 +1025,9 @@ def plot_stim_comparison(img_data, ss_data, metric, psych_params, pixel_dims):
 
         # caclulate the error of the first set of images, computing a numStimPoints vector of errors:
         for stim_idx in np.arange(Ts.size):
-            errs1[stim_idx] = get_error(ref_img,img1[:,stim_idx], metric, psych_params, pixel_dims, img_data)
-            errs2[stim_idx] = get_error(ref_img,img2[:,stim_idx], metric, psych_params, pixel_dims, img_data)
-            errs3[stim_idx] = get_error(ref_img,img3[:,stim_idx], metric, psych_params, pixel_dims, img_data)
+            errs1[stim_idx] = get_error(ref_img,img1[:,stim_idx], metric, psych_params, stixel_dims, img_data)
+            errs2[stim_idx] = get_error(ref_img,img2[:,stim_idx], metric, psych_params, stixel_dims, img_data)
+            errs3[stim_idx] = get_error(ref_img,img3[:,stim_idx], metric, psych_params, stixel_dims, img_data)
         
         return errs1, errs2, errs3
     
@@ -1044,7 +1046,7 @@ def plot_stim_comparison(img_data, ss_data, metric, psych_params, pixel_dims):
         imgs_wms = ss_data.img_set_wms[:,:,i]
         imgs_ssm = ss_data.img_set_ssm[:,:,i]
         ref_img = img_data.img_set[:,i]
-        err_mat_1[i,:], err_mat_2[i,:], err_mat_3[i,:] = get_error_vecs(ref_img, Ts, imgs_mse.T, imgs_wms.T, imgs_ssm.T, metric, psych_params, pixel_dims, img_data)
+        err_mat_1[i,:], err_mat_2[i,:], err_mat_3[i,:] = get_error_vecs(ref_img, Ts, imgs_mse.T, imgs_wms.T, imgs_ssm.T, metric, psych_params, stixel_dims, img_data)
 
     avgs_1 = np.mean(err_mat_1,0)
     stds_1 = np.std(err_mat_1,0) / np.sqrt(num_imgs)
@@ -1233,26 +1235,24 @@ class RetinalCell:
             self.in_refractory = False
         
 class Retina:
-    # Init (A, P, pixel_dims)
-    def __init__(self, A, P, pixel_dims):
+    # Init (A, P, stixel_dims)
+    def __init__(self, params):
         
         
-        self.__A = A
-        self.__P = P
-        self.__pixel_dims = pixel_dims
-        self.__num_cells = A.shape[1]
-        self.__dict_length = P.shape[1]
-        self.__num_pixels = pixel_dims[0]*pixel_dims[1]
-        self.__cells = np.zeros((self.__num_cells),dtype=np.object)
+        self.__A = params.A # linear decoder matrix (from activity to image)
+        self.__P = params.P # dictionary matrix (probabilities of activation for each dictionary electrode stim pattern)
+        self.__num_cells = self.__A.shape[1]   # number of RGCs in the retina
+        self.__dict_length = self.__P.shape[1] # Number of dictionary elements
+        self.__num_stixels = params.stixel_dims[0]*params.stixel_dims[1]  # number of Stimulus pixels in reconstructed image
+        self.__cells = np.zeros((self.__num_cells),dtype=np.object) # array to hold cell objects
         
-        self.activities = np.zeros((self.__num_cells,))
-
+        self.activities = np.zeros((self.__num_cells,))  # array to hold cellular activities for quick access
+        self.stixel_dims = params.stixel_dims # pixel dimensions of the Stimulus reconstruction 
         
         # add cells 
         for i in np.arange(self.__num_cells):
             self.__cells[i] = RetinalCell(i,'parasol')
-   
-        
+      
     def __cell_update(self, cell_num, stim_vector):
         # stimulate cell by calling update on the cell, where
         # the argument of update is 1 with probability stim_prob
@@ -1278,12 +1278,25 @@ class Retina:
     
     def display_image(self):
         # display the image encoded in the retina
-        plt.figure()
-        img = self.get_image_vector()
-        plt.imshow(np.reshape(img,self.__pixel_dims,order='F'),cmap='bone')
-        plt.axis('off')
-        plt.show()
-
+        
+        if plt.fignum_exists(0):
+            fig = plt.figure(0)
+            img = self.get_image_vector()
+            plt.imshow(np.reshape(img,self.__stixel_dims,order='F'),cmap='bone')
+            plt.pause(.00001)
+            fig.canvas.draw()
+        else:
+            plt.figure(0)
+            img = self.get_image_vector()
+            plt.imshow(np.reshape(img,self.__stixel_dims,order='F'),
+                       cmap='bone',
+                       vmax=.5,
+                       vmin=-.5)
+            
+            plt.axis('off')
+            plt.ion()
+            plt.show()
+        
     def stimulate(self, dict_sel):
         # given a dictionary electrode, simulate electrode stimulation and update each cell
         
@@ -1296,29 +1309,166 @@ class Retina:
         for i in np.arange(self.__num_cells):
             self.__cell_update(i,stim_vector)
 
-ret_data = load_raw_data('dict.mat')
+class EyeTracker:
 
-retina = Retina(ret_data.A, ret_data.P, (20,20))
-
-retina.stimulate(100)
-retina.stimulate(300)
-retina.stimulate(1000)
-retina.display_image()
-
+    def __init__(self, simulate_eye_position=True):
+        
+        if simulate_eye_position:
+            self.__count = 0
+            self.__gaze_x = 300
+            self.__gaze_y = 300
+            self.simulate_eye_pos = True
+            self.__sim_jitter = 5
+            self.__saccade_rate = 3 # average fixation time in seconds
+            self.__next_saccade_time = np.random.poisson(self.__saccade_rate)
+            self.__start_time = time.time()
+            self.__curr_time  = time.time()
+    def __get_eye_pos(self):
+        pass
+    
+    def __get_simulated_eye_pos(self):
+#         self.__curr_time = time.time()
+#         if self.__curr_time-self.__start_time >= self.__next_saccade_time:
+#             self.__next_saccade_time = np.random.poisson(self.__saccade_rate)
+#             print('saccade time is: ',self.__next_saccade_time)
+#             self.__start_time = self.__curr_time
+#             self.__gaze_x = np.random.randint(1280) 
+#             self.__gaze_y = np.random.randint(720) + 200
+        self.__gaze_x += int(np.random.randn()*self.__sim_jitter)
+        self.__gaze_y += int(np.random.randn()*self.__sim_jitter)    
+ 
+        return (self.__gaze_x, self.__gaze_y)
+        
+    def get_gaze_center(self):
+        if self.simulate_eye_pos:
+            return self.__get_simulated_eye_pos()
+        else:
+            return self.__get_eye_pos()
+            
 # class ElectrodeArray:
 #     # electrode locations
 #     # dictionary element currents
 #     # stimulate Retina(dictionary)
 #     # get current current
 #     pass
+
+class Parameters:
+    # parameters class is a data structure holding simulation parameters for easy access by other classes
+    def __init__(self, 
+                 A, P, 
+                 vis_ang_horz, vis_ang_vert,
+                 stim_monitor_pixel_size, eye_diam, stixel_size, 
+                 stixel_dims, elec_ang_horz, elec_ang_vert,
+                 use_electrode,
+                 num_stims, max_activity,
+                 eccentricity, k, Ng0, eg, L, is_binocular  ):
+        ## retinal data
+        self.A = A
+        self.P = P
+        self.vis_ang_horz = vis_ang_horz
+        self.vis_ang_vert = vis_ang_vert
+        self.smps = stim_monitor_pixel_size
+        self.elec_ang_horz = elec_ang_horz
+        self.elec_ang_vert = elec_ang_vert
+        ## simulation parameters
+        self.eye_diam = eye_diam
+        self.stixel_size = stixel_size
+        self.stixel_dims = stixel_dims
+        self.electrode = use_electrode
+        self.num_stims = num_stims
+        self.max_act = max_activity
+        ## psychophysical parameters for CSF 
+        self.e = eccentricity
+        self.k = k
+        self.Ng0 = Ng0
+        self.eg = eg
+        self.L = L
+        self.binocular = is_binocular
+
+    @classmethod
+    def empty(cls):
+        return Parameters(None,None,None,None,None,None,None,
+                          None,None,None,None,None,None,None,
+                          None,None,None,None,None)
+
 class GreedyChooser:
     pass
     
 class Camera:
     # receives frames in time
-    # sends frames to greedy 
-    pass
+    
+    def __init__(self, device_id):
+        self.__cap = cv2.VideoCapture(device_id,cv2.CAP_DSHOW)
+        
+        ## for now force resolution to 1080p
+        self.__cap.set(cv2.CAP_PROP_FRAME_WIDTH,1920);
+        self.__cap.set(cv2.CAP_PROP_FRAME_HEIGHT,1080);
+        
+        cam_width = int(self.__cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cam_height =int(self.__cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.camera_resolution = np.asarray([cam_width, cam_height])
+    def get_frame(self):
+            # Capture frame-by-frame
+            ret_val, frame = self.__cap.read()
+            if ret_val:
+                return np.asarray(frame)
+            else:
+                raise "Bad Frame Grab From Camera"    
+  
+    def __del__(self):   
 
+        # When everything done, release the capture
+        self.__cap.release()
+        cv2.destroyAllWindows()
+ 
+class ImageProcessor:
+    # an image processor integrates camera input and eye tracking info
+    # to compute the desired image that will be reconstructed in the device
+            
+    def __init__(self, camera_id, params ):
+        self.__cam = Camera(camera_id)
+        self.__eye_tracker = EyeTracker()
+        
+        self.__electrode_angle_horz = params.elec_ang_horz
+        self.__electrode_angle_vert = params.elec_ang_vert
+        
+        
+        self.__visual_angle_horz = params.vis_ang_horz  
+        self.__visual_angle_vert = params.vis_ang_vert
+        
+        
+        self.__selection_dims = get_selection_dims(params, self.__cam.camera_resolution)
+        
+        self.__stixel_dims = params.stixel_dims
+        
+    def preprocess_image(self,img):
+        # zero mean and normalize scene to -.5,.5 grayscale,  then use eye position to window
+        # image to a desired subimage to be reconstructed, return the preprocessed image
+        
+        ## grayscale rgb image
+        #img = np.sum(img,2)/3
+        
+        ## normalize image to zero-mean [-.5,.5] pixel values
+        #img -= np.mean(img)
+        #img = img/(2*np.max(img))
+        
+        ## window image based on gaze position
+        gaze_pos_x, gaze_pos_y = self.__eye_tracker.get_gaze_center()
+        
+        ## gaze position is center of window, clip edges if window extends bevis_ang_vertnd visual scene (img)
+        dx = int(np.ceil(self.__selection_dims[0]/2))
+        dy = int(np.ceil(self.__selection_dims[1]/2))
+        mask = np.zeros(img.shape)
+        mask[gaze_pos_y-dy:gaze_pos_y+dy,gaze_pos_x-dx:gaze_pos_x+dx,:] = 1
+        img[np.logical_not(mask)] = 0
+        
+        
+        # resample image to have same dimensions as stixels for reconstruction
+        #img = resample(img, self.__selection_dims, self.__stixel_dims, return_flat=False )
+        return img
+
+    def get_stim_frame(self):
+        return self.preprocess_image(self.__cam.get_frame())
 
 class Device:
     # a device is a simulation of a complete retinal prosthetic, encompassing the following:
@@ -1330,10 +1480,10 @@ class Device:
     ## time is measured in stimulations, set by RetinalCell.STIMULATION_RATE
     STIMULATION_RATE = RetinalCell.STIMULATION_RATE
     
-    
-    
-    def __init__(self, A, P, pixel_dims):
-        self.__Retina = Retina()
+    def __init__(self, params ):
+        self.__retina = Retina()
+        self.__imager = EyeTracker()
+        self.__camera = Camera()
     
 
 # greedy reconstruction (real time)
@@ -1362,7 +1512,31 @@ class Device:
 
 ## given preceding image
     
-    
+
+# 
+# ret_data = load_raw_data('dict.mat')
+# 
+# params = Parameters(
+#             ret_data.A, ret_data.P, 
+#             vis_ang_horz=120, vis_ang_vert=100,
+#             stim_monitor_pixel_size=5.5, eye_diam=17, stixel_size=8, 
+#             stixel_dims=(100,100),
+#             use_electrode = False,
+#          )
+# 
+# img_processor = ImageProcessor(1,params)
+# cv2.namedWindow('frame',cv2.WINDOW_FULLSCREEN)
+# out = cv2.VideoWriter('outpy.avi',cv2.VideoWriter_fourcc('M','J','P','G'), 10, (1920,1080))
+# 
+# while True:
+#     frame = img_processor.get_stim_frame()
+#     if frame.shape[0] is not 0 and frame.shape[1] is not 0:
+#         out.write(frame)
+#         cv2.imshow('frame',frame)
+#         cv2.resizeWindow('frame', 1920,1080)
+#     if cv2.waitKey(20) & 0xFF == ord('q'):
+#         break
+#   
 
 
 
