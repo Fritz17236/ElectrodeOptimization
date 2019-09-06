@@ -67,7 +67,6 @@ class RetinaData:
 def metric_compar(img_data, params):
     # Compare Error Metrics Side-by-Side for the same set of images    
     img    = img_data.orig_img
-    img_set = img_data.img_set
     xs     = img_data.xs
     ys     = img_data.ys
     
@@ -77,11 +76,11 @@ def metric_compar(img_data, params):
         print('Solving for Cellular Activities...')    
     
     print('MSE Activity Reconsruction:')
-    imgs_mse, acts_mse = recons_img_set(img_set,img_data, params, "mse")
+    imgs_mse, acts_mse = recons_img_set(img_data, params, "mse")
     print('wMSE Activity Reconstruction')
-    imgs_wms, acts_wms = recons_img_set(img_set,img_data, params, "wms")
+    imgs_wms, acts_wms = recons_img_set(img_data, params, "wms")
     print('SSIM Activity Reconstruction')
-    imgs_ssm, acts_ssm = recons_img_set(img_set,img_data, params, "ssm")
+    imgs_ssm, acts_ssm = recons_img_set(img_data, params, "ssm")
     
     print('Activities Solved. Rebuilding Images ...')
     
@@ -107,7 +106,7 @@ def metric_compar(img_data, params):
     
     return sim_data
     
-def recons_img_set(img_set, img_data, params, metric):
+def recons_img_set(img_data, params, metric):
     # Given a set of images (img_set) as a 2d Matrix, and a metric, reconstruct
     # the image set according to the given image in parallel according to the available cpu cores    
     if params.electrode:
@@ -116,11 +115,10 @@ def recons_img_set(img_set, img_data, params, metric):
         activity_length = params.A.shape[1]
     
     num_imgs   = img_data.num_imgs
-    
     # convert img_set to list for parallelization
     img_list = []
     for i in np.arange(num_imgs):
-        img_list.append(img_set[:,i])
+        img_list.append(img_data.img_set[:,i])
      
     # run reconstructions in parallel
     results = np.asarray(Parallel(n_jobs=-2)(delayed(act_solver)(i,img_data, params,metric) for i in tqdm(img_list)))
@@ -153,32 +151,99 @@ def save_data(data,file_name):
 def load_data(file_name):
     return pickle.load(open(file_name,'rb'))
 
-def load_raw_data(file_name):
-    
+def load_raw_data(file_name, full_stixel_dims, position, width, height):
     # loads raw data from matlab .mat file
-    data = scipy.io.loadmat(file_name)
-    A   = (data['stas'].T)
-    # Select 20x20 slice of Pixels from A to fix border issues
-    P,e_map = prune_dict(data['dictionary'].T,data['ea'])
-
-    e_locs = data['elec_loc']  # electrode locations
-    dictLength = P.shape[1]
-    num_stixels = A.shape[0]
-
-    # Trim A to a 20 x 20 Square
-    Aslice = np.zeros((400,A.shape[1]))
-    for col in np.arange(8,28):
-        Aslice[(col-8)*20:(col-7)*20,:] = A[30+80*col:50+80*col,:]
-
-    A,P = prune_decoder(Aslice,P)
     
+    def prune_decoder(A,P):
+        # remove the columns of A corresponding to the cells which don't change the image
+        # reconstruction
+        # also delete the corresponding rows of P
+        # if a column of A has a norm of 0 it must be all 0, so delete the column. 
+        delList = []
+        for i in np.arange(A.shape[1]):
+            if (np.linalg.norm(A[:,i])) <= 10**-6:
+                delList.append(i)
+                
+        return np.delete(A,delList,axis=1),np.delete(P,delList,axis=0)
+
+    def prune_dict(P,eActs,threshold=.05):
+        # Given a dictionary and a threshold value, remove any dictionary elements whose maximum value is 
+        # below the threshold.  Append an element of zeros to the pruned dictionary. 
+        pp = P.copy()
+        pp[pp <= threshold] = 0
+        
+        dictLength = pp.shape[1]
+        toDel = []
+        for i in  np.arange(dictLength):
+            if ~np.any(pp[:,i]):
+                toDel.append(i)
+        if ~np.any(pp[:,dictLength-1]):
+                toDel.append(dictLength-1)
+        
+        
+        pp = np.delete(pp,toDel,axis=1)
+        eActs = np.delete(eActs,toDel,axis=0)
+        
+        return pp, eActs
+        # only do if greedy: return np.hstack((pp,np.zeros((pp.shape[0],1)))),  np.vstack((eActs,np.asarray(np.zeros((1,eActs.shape[1])))))
+    
+    def normalize_cell_stas(A,norm='l2'):
+        # given a num_pixel x num_cell decoder matrix,
+        # normalize each cell (each column) to unity
+        # norm (either inf_norm or l2)
+        
+        # first record the original max value
+        if norm == 'l2':
+            max_val = np.max(np.linalg.norm(A,axis=0))
+        elif norm == 'inf':
+            max_val = np.max(np.abs(A))
+        
+        
+        #go through each column
+        for i in np.arange(A.shape[1]):
+            if norm == 'l2':
+                A[:,i] = A[:,i] / np.linalg.norm(A[:,i])
+                
+            elif norm == 'inf':
+                A[:,i] = A[:,i] / np.max(np.abs(A[:,i]))
+        
+        return  max_val * A
+            
+    def trim_decoder(A, image_dims, coords, width, height):
+        # Trim the (image_dims) image that A maps to to a width x height
+        # rectangle with the top left situated at coords
+        # square
+        A_slice = np.zeros((width*height,A.shape[1]))
+        
+        col_size = image_dims[0]
+     
+        for col in np.arange(coords[1],coords[1]+height):
+            A_slice[width*(col-coords[1]):width*(col-coords[1]+1),:] = A[coords[0]+col_size*col:coords[0]+width+col_size*col,:] 
+    
+        return A_slice
+    
+    data = scipy.io.loadmat(file_name)
+    
+    ## preprocess decoder matrix: trim to desired dimensions, prune 0 entries and normalize STAs.
+    A   = (data['stas'].T)
+    A = trim_decoder(A, full_stixel_dims, position, width, height)
+    
+    P,e_map = prune_dict(data['dictionary'].T,data['ea'])
+    e_locs = data['elec_loc']  # electrode locations
+    
+    A,P = prune_decoder(A,P)
+    dict_len = P.shape[1]
+    num_stixels = A.shape[0]
+    A = normalize_cell_stas(A,'inf')
+    
+    # save data in RetinaData Object
     ret_data = RetinaData()
     ret_data.A = A
     ret_data.P = P
     ret_data.e_locs = e_locs
     ret_data.e_map  = e_map
     ret_data.num_stixels = num_stixels
-    ret_data.dict_len = dictLength
+    ret_data.dict_len = dict_len
     ret_data.num_cells = A.shape[1]
     
     return ret_data
@@ -333,7 +398,7 @@ def csf(params,offset=0):
         #given spatial frequency f and psychophysical parameters,
         # calculate the  illumance term of the CSF
         n = .03  #quantum efficiency term (function of eccentricity)
-        e = params
+        e = params.e
         term1 = .4 / (1 + (e/7)**2)
         term2 = .48 / (1 + (e/20)**2) 
         n = n*(term1 + term2 +.12)
@@ -356,7 +421,7 @@ def csf(params,offset=0):
     
     k  = params.k
     X0 = params.elec_ang_horz
-    T  = params.num_stims
+    T  = params.T
     sf_res = 1/params.stixel_dims[0]
     Ng = getNg(params)
     Ng0 = params.Ng0
@@ -378,39 +443,6 @@ def csf(params,offset=0):
     W = np.divide(num,denom)
     return W
 
-def prune_decoder(A,P):
-    # remove the columns of A corresponding to the cells which don't change the image
-    # reconstruction
-    # also delete the corresponding rows of P
-    # if a column of A has a norm of 0 it must be all 0, so delete the column. 
-    delList = []
-    for i in np.arange(A.shape[1]):
-        if (np.linalg.norm(A[:,i])) <= 10**-6:
-            delList.append(i)
-            
-    return np.delete(A,delList,axis=1),np.delete(P,delList,axis=0)
-
-def prune_dict(P,eActs,threshold=.05):
-    # Given a dictionary and a threshol value, remove any dictionary elements whose maximum value is 
-    # below the threshold.  Append an element of zeros to the pruned dictionary. 
-    pp = P.copy()
-    pp[pp <= threshold] = 0
-    
-    dictLength = pp.shape[1]
-    toDel = []
-    for i in  np.arange(dictLength):
-        if ~np.any(pp[:,i]):
-            toDel.append(i)
-    if ~np.any(pp[:,dictLength-1]):
-            toDel.append(dictLength-1)
-    
-    
-    pp = np.delete(pp,toDel,axis=1)
-    eActs = np.delete(eActs,toDel,axis=0)
-    
-    return pp, eActs
-    # only do if greedy: return np.hstack((pp,np.zeros((pp.shape[0],1)))),  np.vstack((eActs,np.asarray(np.zeros((1,eActs.shape[1])))))
-    
 def mse(A,B):
     #flatten if not flat
     if A.ndim > 1:
@@ -615,12 +647,12 @@ def act_solver(img,img_data,params,mode):
                 cost = 1
                 phi = A
 
-            T = params.num_stims
+            num_stims = params.num_stims
             N = params.max_act
-            if T == -1:
+            if num_stims == -1:
                 constraints = [x <= N, x >= 0, cvxineq(alpha,y,x,phi) <= 0]
             else:
-                constraints = [x <= N, x >= 0, cvxineq(alpha,y,x,phi) <= 0, cp.sum(x) <= T]
+                constraints = [x <= N, x >= 0, cvxineq(alpha,y,x,phi) <= 0, cp.sum(x) <= num_stims]
 
             prob= cp.Problem(cp.Minimize(cost),constraints)
             try:
@@ -633,6 +665,7 @@ def act_solver(img,img_data,params,mode):
             else:
                 return False, x.value
 
+        
         A = params.A
         P = params.P
         if params.electrode:
@@ -642,7 +675,7 @@ def act_solver(img,img_data,params,mode):
 
 
         # image preprocessing 
-        y = img 
+        y = img
 
 
         # bisection initialization
@@ -701,14 +734,7 @@ def act_solver(img,img_data,params,mode):
         if params.electrode:
             cost = cp.sum_squares(W@D@(y-A@P@x)) + var_term(params, W@D@A, x)
         else:
-            try:
-                cost = cp.sum_squares(W@D@(y-A@x))
-            except:
-                print(W.shape)
-                print(D.shape)
-                print(y.shape)
-                print(x.shape)
-                print(A.shape)
+            cost = cp.sum_squares(W@D@(y-A@x))
             
     elif mode == "ssm": 
         # custom SSIM bisection search solver
@@ -728,68 +754,7 @@ def act_solver(img,img_data,params,mode):
     if params.electrode:
         return A@P@x.value, x.value
     else:
-        try:
-            return A@x.value, x.value
-        except:
-                print(W.shape)
-                print(D.shape)
-                print(y.shape)
-                print(x.shape)
-                print(A.shape)
-                return
-    
-def num_stim_sweep(img_data,sim_params,psych_params,electrode):
-    # Given a set of images, reconstruct each image using all metric and sweep over the number of allowable stimulations.
-    # run a metric comparison simulation over a specified number of stimulation times
-    
-    Tres = 16
-    Ts   = np.logspace(0,5,Tres)
-    
-    img_set_mses = []
-    img_set_wmss = []
-    img_set_ssms = []
-    
-    act_set_mses = []
-    act_set_wmss = []
-    act_set_ssms = []
-    
-    rec_set_mses = []
-    rec_set_wmss = []
-    rec_set_ssms = []
-    
-    for Tidx, T in enumerate(Ts):
-        print("T: %i;  %i/%i"%(T, Tidx+1, Ts.size))
-        sim_params["num_stims"] = T
-        
-        sim_data  =  metric_compar(img_data,sim_params,psych_params, electrode)
-        
-        img_set_mses.append(sim_data.imgs_mse)
-        img_set_wmss.append(sim_data.imgs_wms)
-        img_set_ssms.append(sim_data.imgs_ssm)
-
-        act_set_mses.append(sim_data.acts_mse)
-        act_set_wmss.append(sim_data.acts_wms)
-        act_set_ssms.append(sim_data.acts_ssm)
-
-        rec_set_mses.append(sim_data.recons_mse)
-        rec_set_wmss.append(sim_data.recons_wms)
-        rec_set_ssms.append(sim_data.recons_ssm)
-        
-        ss_data = StimSweepData()
-        ss_data.Ts        = Ts
-        ss_data.img_set_mse = np.asarray(img_set_mses)
-        ss_data.img_set_wms = np.asarray(img_set_wmss)
-        ss_data.img_set_ssm = np.asarray(img_set_ssms)
-        
-        ss_data.act_set_mse = np.asarray(act_set_mses)
-        ss_data.act_set_wms = np.asarray(act_set_wmss)
-        ss_data.act_set_ssm = np.asarray(act_set_ssms)
-        
-        ss_data.rec_set_mse = np.asarray(rec_set_mses)
-        ss_data.rec_set_wms = np.asarray(rec_set_wmss)
-        ss_data.rec_set_ssm = np.asarray(rec_set_ssms)
-        
-    return ss_data
+        return A@x.value, x.value
 
 def resample(img,curr_dims, desiredDims, return_flat = True):
     
@@ -808,114 +773,6 @@ def resample(img,curr_dims, desiredDims, return_flat = True):
         return np.reshape(zImg,(desiredDims[0]*desiredDims[1],),order='F')
     else:
         return zImg
-
-## Visualization Functions
-
-def pca_analysis(imgs,acts_mse,acts_wms, acts_ssm):
-    # given a set of images, electrode locations, and their dictionary reconstructions,
-    # calculate correlations (if any) of electrode activity across the set of images 
-    num_imgs = imgs.shape[1]
-
-    data = np.hstack((acts_mse,acts_wms,acts_ssm))
-    covdata = np.cov(data) # covariance matrix
-    wdata,vdata = np.linalg.eig(covdata) # eigen decomposition of covariance matrix
-
-    # project each activity vector onto the 3 respective components
-    (data1,data2,data3) = project_PCA(data,vdata[:,0],vdata[:,1],vdata[:,2])
-
-    markerSize = 1
-
-    # 3D Scatter Plot of Image Data Projected onto principal Axes
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(data1[0:num_imgs-1],data2[0:num_imgs-1],data3[0:num_imgs-1],label='MSE',s=markerSize)
-    ax.scatter(data1[num_imgs:2*num_imgs-1],data2[num_imgs:2*num_imgs-1],data3[num_imgs:2*num_imgs-1],label='wMSE',s=markerSize)
-    ax.scatter(data1[2*num_imgs:],data2[2*num_imgs:],data3[2*num_imgs:],c='red',label='SSIM',s=markerSize)
-    ax.set_xlabel('Principal Component 1')
-    ax.set_ylabel('Principal Component 2')
-    ax.set_zlabel('Principal Component 3')
-    plt.legend(loc='upper right')
-    plt.show()
-    
-    xLims = 2
-    yLims = 1
-
-    # 2D Plot Projected Onto Principal Axes
-    plt.figure()
-    plt.scatter(data1[0:num_imgs-1],data2[0:num_imgs-1],s=markerSize,label='MSE')
-    plt.scatter(data1[num_imgs:2*num_imgs-1],data2[num_imgs:2*num_imgs-1],s=markerSize,label='JPG')
-    plt.scatter(data1[2*num_imgs:],data2[2*num_imgs:],c='red',label='SSIM',s=markerSize)
-    plt.title('PC1 & PC2')
-    plt.legend()
-    plt.xlim([-xLims,xLims])
-    plt.ylim([-yLims,yLims])
-    plt.savefig('PC1PC2Electrode.jpg',bbox_inches='tight')
-    plt.show()
-
-
-    plt.figure()
-    plt.scatter(data1[0:num_imgs-1],data3[0:num_imgs-1],s=markerSize,label='MSE')
-    plt.scatter(data1[num_imgs:2*num_imgs-1],data3[num_imgs:2*num_imgs-1],s=markerSize,label='JPG')
-    plt.scatter(data1[2*num_imgs:],data3[2*num_imgs:],c='red',label='SSIM',s=markerSize)
-    plt.title('PC1 & PC3')
-    plt.legend()
-    plt.xlim([-xLims,xLims])
-    plt.ylim([-yLims,yLims])
-    plt.savefig('PC1PC3Electrode.jpg',bbox_inches='tight')
-    plt.show()
-
-    plt.figure()
-    plt.scatter(data2[0:num_imgs-1],data3[0:num_imgs-1],s=markerSize,label='MSE')
-    plt.scatter(data2[num_imgs:2*num_imgs-1],data3[num_imgs:2*num_imgs-1],s=markerSize,label='JPG')
-    plt.scatter(data2[2*num_imgs:],data3[2*num_imgs:],c='red',label='SSIM',s=markerSize)
-    plt.xlim([-xLims,xLims])
-    plt.ylim([-yLims,yLims])
-    plt.title('PC2 & PC3')
-    plt.legend()
-    plt.savefig('PC2PC3Electrode.jpg',bbox_inches='tight')
-    plt.show()
-
-    return wdata,vdata
-
-def project_PCA(data,pc1,pc2,pc3):
-    #given a data_dim x num_pts matrix of data, and 3 data_dim principal component vectors,
-    #return a num_pts vector containing the scalar projection of the data onto the vector at each numpt
-
-    num_pts = data.shape[1]
-    proj1 = np.zeros((num_pts,))
-    proj2 = np.zeros((num_pts,))
-    proj3 = np.zeros((num_pts,))
-
-    for i in np.arange(num_pts):
-        proj1[i] = np.dot(data[:,i],pc1)/(np.linalg.norm(pc1)*np.linalg.norm(data[:,i]))
-        proj2[i] = np.dot(data[:,i],pc2)/(np.linalg.norm(pc2)*np.linalg.norm(data[:,i]))
-        proj3[i] = np.dot(data[:,i],pc3)/(np.linalg.norm(pc3)*np.linalg.norm(data[:,i]))
-    return (proj1,proj2,proj3)
-
-def disp_elec_act(elecActs,sim_params,color='blue'):
-    # Given a vector of electrode activities, a vector of (x,y) electrode locations, and a 2xnumElectrode (contained in simparams)
-    # matrix of electrode numbers for each element, sum the total current passing through each electrode, 
-    # and display it in a scatter plot
-    e_locs = sim_params["e_locs"]
-    
-    totalCurr = get_total_curr(elecActs,sim_params)
-    
-    plt.scatter(e_locs[:,0],e_locs[:,1],alpha=.5,s=totalCurr,c=color)
-    plt.scatter(e_locs[:,0],e_locs[:,1],alpha=.5,s=1,c='black')
-    plt.title('Total Electrode Current: %i nC' %np.sum(totalCurr))
-    plt.axis('equal')
-    plt.xlabel('Horizontal Position (um)')
-    plt.ylabel('Vertical Position (um)')
-
-def get_total_curr(acts, sim_params):
-    # given a vector of activities, get the total current from that 
-    # set of activities that is passed through the electrode array
-    return acts.T@sim_params["e_map"][:,0]
-
-def angle_between(vecA,vecB):
-    # return the cosine of the angle between to vectors:
-    ang = np.arccos(np.dot(vecA,vecB)/(np.linalg.norm(vecA)*np.linalg.norm(vecB)))
-    return ang
 
 def rebuild_img(img,img_set,xs,ys,params,zeroMean=False): 
     # input params:
@@ -956,180 +813,10 @@ def rebuild_img(img,img_set,xs,ys,params,zeroMean=False):
             reconsSel -= np.mean(reconsSel) 
         recons[x:x+selection.shape[0],y:y+selection.shape[1]] += reconsSel
     
-    return recons  
-
-def act_angle_plot(acts_mse, other_acts, other_label, r_lim, a=.5):
-    # given two act_length x num_imgs matrices of activity over a num_imgs set of images,
-    # calculate the angle between each pair of activities over all image and plot this
-    # angle on a polar graph, where the radius of each data point is the sum of the 
-    # activity of the other activity minus the sum of the MSE activity.
-    
-    num_imgs =  acts_mse.shape[1]
-    angles = np.zeros((num_imgs,))
-    radii  = np.zeros((num_imgs,))
-    
-    for imgNum in np.arange(num_imgs):
-        angles[imgNum] = angle_between(acts_mse[:,imgNum],other_acts[:,imgNum])
-        radii[imgNum]  =(np.sum(other_acts[:,imgNum])-np.sum(acts_mse[:,imgNum])) 
-    
-    pos = radii >= 0
-    neg = radii <  0 
-
-    avg_ang = np.mean(angles)
-    str_rads = np.linspace(0,r_lim,angles.size)
+    return recons.T  
 
     
-    
-    plt.polar(avg_ang*np.ones(angles.shape),str_rads,'-',c='black',
-              linewidth=5,
-              alpha=.5)
-    plt.polar(angles[pos],radii[pos],'ro',c='red',alpha=a)
-    plt.polar(angles[neg],np.abs(radii[neg]),'ro',c='blue',alpha=a)
-    ax = plt.gca()
-    ax.set_rlim(0,r_lim)
-    plt.title('Angle Between MSE & '+other_label+
-              ' Activity \n Avg Angle: %i deg'%np.rad2deg(avg_ang))
-    return
-
-def plot_stim_comparison(img_data, ss_data, metric, psych_params, stixel_dims):
-    # plot the error of given image sets versus number of stimulations according to  a specified metric, average over
-    #  all images for each number of stimulations data point
-    # Input: img_data: img_data object created by preprocess_img function
-    #        metric: metric according to which activities 1 and 2 will be plotted/calculated: "mse", "wms", or "ssm"
-    #        psych_params: a psychophysical parameters object 
-    #        ss_data: Stimulation Sweep Data output from num_stim_sweep Function
-    #        stixel_dims:  the dimensions of the unflattened image (e.g. (20, 20) )
-    
-    def get_error(ref_img, img, metric,psych_params,stixel_dims, img_data):
-        # given two images, calculate the error according to the given metric
-        # metric = "mse", "jpg", or "ssm"
-        if metric.upper() == "MSE":
-            return mse(ref_img, img)/mse(ref_img, np.zeros(ref_img.shape))
-        elif metric.upper() == "WMS" :
-            return jpge(ref_img, img, psych_params, stixel_dims, img_data) / jpge(ref_img, np.zeros(ref_img.shape), psych_params, stixel_dims, img_data)
-        elif metric.upper() == "SSIM":
-            return ((1-SSIM(ref_img, img))/2) / ((1-SSIM(ref_img,np.zeros(ref_img.shape)/2)))
-        else: 
-            raise Exception("Bad Metric Passed to get_error")
-    
-    def get_error_vecs(ref_img, Ts, img1, img2, img3, metric, psych_params, stixel_dims, img_data):
-        # given single images generated over numStimPoints number of stimulations, return a numStimPointsx1 vector 
-        # of error of each image according to the given metric
-        # img1, img2, img3:  3 num_pixels x numStimPoints matrices of activity(error is calculated over pixels)
-        
-        # Initialization
-        errs1 = np.zeros((Ts.size,)) # Error Vector for set 1
-        errs2 = np.zeros((Ts.size,)) # Error Vector for set 2
-        errs3 = np.zeros((Ts.size,)) # Error Vector for set 3
-
-
-        # caclulate the error of the first set of images, computing a numStimPoints vector of errors:
-        for stim_idx in np.arange(Ts.size):
-            errs1[stim_idx] = get_error(ref_img,img1[:,stim_idx], metric, psych_params, stixel_dims, img_data)
-            errs2[stim_idx] = get_error(ref_img,img2[:,stim_idx], metric, psych_params, stixel_dims, img_data)
-            errs3[stim_idx] = get_error(ref_img,img3[:,stim_idx], metric, psych_params, stixel_dims, img_data)
-        
-        return errs1, errs2, errs3
-    
-    # Initialization
-    num_imgs = img_data.num_imgs
-    Ts      = ss_data.Ts
-    err_mat_1 = np.zeros((num_imgs,Ts.size))  # holds err vs stimulation vectors for num_imgs, from img_set 1
-    err_mat_2 = np.zeros((num_imgs,Ts.size))  # same for img_set 2
-    err_mat_3 = np.zeros((num_imgs,Ts.size))  # same for img_set 3
-
-    
-    
-    # For each image i, generate the error vectors for imgs1, imgs2 and store in err_mat_1, err_mat_2
-    for i in np.arange(num_imgs):
-        imgs_mse = ss_data.img_set_mse[:,:,i]
-        imgs_wms = ss_data.img_set_wms[:,:,i]
-        imgs_ssm = ss_data.img_set_ssm[:,:,i]
-        ref_img = img_data.img_set[:,i]
-        err_mat_1[i,:], err_mat_2[i,:], err_mat_3[i,:] = get_error_vecs(ref_img, Ts, imgs_mse.T, imgs_wms.T, imgs_ssm.T, metric, psych_params, stixel_dims, img_data)
-
-    avgs_1 = np.mean(err_mat_1,0)
-    stds_1 = np.std(err_mat_1,0) / np.sqrt(num_imgs)
-    avgs_2 = np.mean(err_mat_2,0)
-    stds_2 = np.std(err_mat_2,0) / np.sqrt(num_imgs)
-    avgs_3 = np.mean(err_mat_3,0)
-    stds_3 = np.std(err_mat_3,0) / np.sqrt(num_imgs)
-    
-    plt.semilogx(Ts,avgs_1)
-    plt.semilogx(Ts,avgs_2)
-    plt.errorbar(Ts,avgs_1,yerr=stds_1,label="MSE")
-    plt.errorbar(Ts,avgs_2,yerr=stds_2,label="wMSE")
-    plt.errorbar(Ts,avgs_3,yerr=stds_3,label="SSIM")
-
-    plt.xlabel('Number of Allowable Stimulations')
-    plt.ylabel("Error")
-    string = "Relative " + metric + " Error vs. Number of Stimulations"
-    plt.title(string)
-    plt.ylim([0,1])
-    plt.legend()
-    
-def contrast(img, mode='rms'):
-    #return the contrast value of a given image. Different modes correspond to different definitions of contrast:
-    # Possible modes are: Weber, Michelson, and RMS. 
-    
-    
-    lMax = np.max(img)
-    lMin = np.min(img)
-        
-    if mode.upper() == 'WEB':
-        return (lMax-lMin)/lMin
-    
-    if mode.upper() == 'MICH':
-        return (lMax-lMin)/(lMax+lMin)
-    
-    if mode.upper() == 'RMS':
-        flatImg = img.flatten()
-        return np.std(flatImg)
-    
-def relative_contrast(img, ref_img, mode):
-    # returns the relative contrast of an original image and its reference.
-    # relative contrast is the ratio of the image contrast with that of reference
-    return  contrast(img,mode) / contrast(ref_img, mode)
-
-def get_img_set_contrast(img_set, mode):
-    # given a numPixel x num_imgs set of images, and a same dimension set of reference images,
-    # determine the  relative contrast of that set averaged over all the images. 
-    # relative contrast is the ratio between img and reference contrasts
-    # return the average and standard error of the mean of the relative contrasts
-    num_imgs = img_set.shape[1]
-    rel_cons  = np.zeros((num_imgs,))
-    for i in np.arange(num_imgs):
-        rel_cons[i] = contrast(img_set[:,i],mode)
-    return np.mean(rel_cons), np.std(rel_cons)/np.sqrt(num_imgs)
-
-def stim_sweep_contrast_compar(img_data, ss_data, mode):
-    # Plot the average relative contrast between 3 sets sweeping over all number of allowed timesteps
-    Ts = ss_data.Ts
-    
-    mse_rel_cons  = np.zeros((Ts.size,))
-    mse_stds     = np.zeros(mse_rel_cons.shape)
-    wms_rel_cons  = np.zeros((Ts.size,))
-    wms_stds     = np.zeros(mse_rel_cons.shape)
-    ssm_rel_cons  = np.zeros((Ts.size,))
-    ssm_stds     = np.zeros(mse_rel_cons.shape)
-
-    for i in np.arange(Ts.size):
-        mse_rel_cons[i], mse_stds[i] = get_img_set_contrast(ss_data.img_set_mse[i,:,:], img_data.img_set,mode)        
-        wms_rel_cons[i], wms_stds[i] = get_img_set_contrast(ss_data.img_set_wms[i,:,:], img_data.img_set,mode)        
-        ssm_rel_cons[i], ssm_stds[i] = get_img_set_contrast(ss_data.img_set_ssm[i,:,:], img_data.img_set,mode)        
- 
-    
-    plt.errorbar(Ts,mse_rel_cons,yerr=(mse_stds),label='MSE Contrast')
-    plt.errorbar(Ts,wms_rel_cons,yerr=(wms_stds),label='wMSE Contrast')
-    plt.errorbar(Ts,ssm_rel_cons,yerr=(ssm_stds),label='SSIM Contrast')
-    
-    plt.xlabel('Number of Allowable Spikes')
-    plt.ylabel('Average RMS Contrast')
-    plt.xscale("log")
-    plt.legend()
-
-    
-### Workspace ###
+### Device Programming
 
 class ActivityQueue:
     # An activity queue is an int_time length queue data
@@ -1539,8 +1226,17 @@ class Device:
 #   
 
 
+### Workspace
 
 
-
+# def get_band_rms(image):
+#     # split an image into separate bandwidths (cycles per degree of visual field) 
+#     # and measure the RMS energy of each band
+#         pass
+#     
+#     def get_band_power(image, start_freq, stop_freq, params):
+#         # bandpass filter a given image between start_freq and stop_freq (assuming ideal filter)
+#         # return the RMS value of the remaining filter coefficients (energy of the band)
+#          pass 
 
 
